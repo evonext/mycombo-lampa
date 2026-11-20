@@ -21,7 +21,7 @@
 
   var NAME = 'mycombo';
   var TTL = 10 * 60 * 1000;
-  var TIMEOUT = 12000;
+  var TIMEOUT = 20000;
   // Серверы Lampac по умолчанию (можно изменить в настройках). Берутся только бесплатные балансеры.
   var DEFAULT_LAMPAC = 'https://rust.bwa.ad';
 
@@ -142,64 +142,96 @@
     }, function () { done([]); });
   }
 
-  // Сервер, совместимый с Lampac (/lite/events → список балансеров → /lite/{balanser}).
-  // Берутся только балансеры без account_only/paid; всё платное и привязанное к аккаунту отбрасывается.
+  // Сервер с протоколом online.js:
+  //   /lite/events            → [{balanser, name, account_only, ...}]
+  //   /lite/{balanser}?params → {streams:[{url, quality, voice, subtitles, ...}]}
+  // Платные балансеры опрашиваются, если включена настройка «Все балансеры»; при отказе сервера — пропускаются.
+  function myUid() {
+    var u = get('uid', '');
+    if (!u) { u = 'mc' + Math.random().toString(36).slice(2, 12) + Date.now().toString(36); set('uid', u); } // собственный id плагина
+    return u;
+  }
+  function isTv(m) { return !!(m.name || m.first_air_date || m.number_of_seasons); }
+  function lcParams(movie, extra) {
+    var o = {
+      id: movie.id, tmdb_id: movie.id, imdb_id: movie.imdb_id, kinopoisk_id: movie.kinopoisk_id,
+      title: movie.title || movie.name, original_title: movie.original_title || movie.original_name,
+      original_language: movie.original_language, serial: isTv(movie) ? 1 : 0,
+      year: ((movie.release_date || movie.first_air_date || '') + '').slice(0, 4), uid: myUid()
+    };
+    var g = (movie.genres || []).map(function (x) { return x && x.id; }).filter(Boolean).join(',');
+    if (g) o.genres = g;
+    for (var k in (extra || {})) o[k] = extra[k];
+    Object.keys(o).forEach(function (k) { if (o[k] === undefined || o[k] === null || o[k] === '') delete o[k]; });
+    return $.param(o);
+  }
+  function preview(j) {
+    try { return (typeof j === 'string' ? j : JSON.stringify(j)).replace(/\s+/g, ' ').slice(0, 140); } catch (e) { return ''; }
+  }
+  function parseStreams(j, b, host) {
+    if (typeof j === 'string') { try { j = JSON.parse(j); } catch (e) { return []; } }
+    var st = (j && j.streams) || [];
+    var out = [];
+    st.forEach(function (s) {
+      if (!s || !s.url) return;
+      var item = {
+        src: host + '/' + b.balanser, srcn: b.name || b.balanser,
+        voice: ((s.voice || '') + '').trim() || b.name || b.balanser,
+        quality: s.quality || '', url: s.url
+      };
+      if (Array.isArray(s.subtitles)) {
+        item.subtitles = s.subtitles.filter(function (x) { return x && x.url; })
+          .map(function (x) { return { label: x.label || x.name || x.lang || 'sub', url: x.url }; });
+      }
+      if (!bad(item)) out.push(item);
+    });
+    return out;
+  }
+
   function fromLampac(base, movie, season, done) {
     base = (base + '').replace(/\/+$/, '');
-    var q = query(movie, season);
-    var lq = {
-      id: movie.id, imdb_id: q.imdb, kinopoisk_id: q.kp, title: q.title,
-      original_title: movie.original_title || movie.original_name || '',
-      serial: movie.name ? 1 : 0, year: q.year, source: 'tmdb', rjson: 'true'
-    };
-    if (season) lq.s = season;
-    var out = [], host = hostOf(base);
-    request(base + '/lite/events?' + $.param(lq), function (list) {
+    var host = hostOf(base);
+    request(base + '/lite/events?' + lcParams(movie), function (list) {
       if (typeof list === 'string') { try { list = JSON.parse(list); } catch (e) {} }
-      if (!Array.isArray(list)) { note(host + ': /lite/events вернул не список (' + (typeof list) + ')'); return done([]); }
+      if (!Array.isArray(list)) { note(host + ': /lite/events вернул не список: ' + preview(list)); return done([]); }
       var bals = list.filter(function (b) {
         return b && b.balanser && b.balanser !== 'example' && (fld('paid', true) || (!b.account_only && !b.paid && !b.need_auth));
       }).slice(0, 40);
       note(host + ': балансеров всего ' + list.length + ', к опросу ' + bals.length + (bals.length ? ' (' + bals.map(function (b) { return b.balanser; }).join(', ') + ')' : ''));
       if (!bals.length) return done([]);
-      var pending = bals.length;
-      function fin() { if (!--pending) done(out); }
+      var out = [];
 
-      function parse(b, j, depth, cb) {
-        if (typeof j === 'string') { try { j = JSON.parse(j); } catch (e) { return cb(); } }
-        var data = j && j.data;
-        if (!Array.isArray(data)) return cb();
-        var waiting = 1;
-        function end() { if (!--waiting) cb(); }
-        data.forEach(function (d) {
-          if (!d || !d.url) return;
-          if (d.method === 'link' && depth < 2) {
-            waiting++;
-            request(d.url, function (r) { parse(b, r, depth + 1, end); }, end);
-            return;
-          }
-          if (d.method && d.method !== 'play') return;
-          var url = d.url, quality = d.quality;
-          if (quality && typeof quality === 'object') { // {"1080p": url, ...} → лучшее
-            var ks = Object.keys(quality).sort(function (a, c) { return qRank(c) - qRank(a); });
-            if (ks.length) { url = quality[ks[0]]; quality = ks[0]; } else quality = '';
-          }
-          var item = {
-            src: host + '/' + b.balanser, srcn: b.name || b.balanser, voice: d.voice_name || d.translate || b.name || b.balanser,
-            quality: quality || d.maxquality || '', title: d.title || d.name || '',
-            url: url, subtitles: Array.isArray(d.subtitles) ? d.subtitles.map(function (s) { return { label: s.label, url: s.url }; }) : undefined,
-            season: d.season, episode: d.episode
-          };
-          if (!bad(item)) out.push(item);
+      if (isTv(movie)) {
+        // сериал: серии берутся из TMDB, поток запрашивается при выборе серии
+        var seasons = (movie.seasons || []).filter(function (s) { return s && s.season_number > 0 && s.episode_count > 0; });
+        if (!seasons.length) seasons = [{ season_number: 1, episode_count: 12 }];
+        bals.forEach(function (b) {
+          seasons.forEach(function (s) {
+            for (var e = 1; e <= s.episode_count; e++) (function (sn, ep) {
+              out.push({
+                src: host + '/' + b.balanser, srcn: b.name || b.balanser, voice: b.name || b.balanser,
+                season: sn, episode: ep, title: 'Серия ' + ep,
+                resolve: function (cb) {
+                  request(base + '/lite/' + encodeURIComponent(b.balanser) + '?' + lcParams(movie, { season: sn, episode: ep }),
+                    function (j) { cb(parseStreams(j, b, host)); }, function () { cb([]); });
+                }
+              });
+            })(s.season_number, e);
+          });
         });
-        end();
+        note(host + ': сериал, потоки запрашиваются при выборе серии');
+        return done(out);
       }
 
+      var pending = bals.length;
+      function fin() { if (!--pending) done(out); }
       bals.forEach(function (b) {
-        request(base + '/lite/' + encodeURIComponent(b.balanser) + '?' + $.param(lq), function (j) {
-          var before = out.length;
-          parse(b, j, 0, function () { note(host + '/' + b.balanser + ': потоков ' + (out.length - before)); fin(); });
-        }, function (code) { note(host + '/' + b.balanser + ': ошибка ' + code); fin(); }); // 401/402/403 → балансер пропускается
+        request(base + '/lite/' + encodeURIComponent(b.balanser) + '?' + lcParams(movie), function (j) {
+          var r = parseStreams(j, b, host);
+          out = out.concat(r);
+          note(host + '/' + b.balanser + ': потоков ' + r.length + (r.length ? '' : ' · ответ: ' + preview(j)));
+          fin();
+        }, function (code) { note(host + '/' + b.balanser + ': ошибка ' + code); fin(); });
       });
     }, function (code) { note(host + ': /lite/events недоступен, код ' + code + (code === 0 ? ' (сеть/CORS/блокировка)' : '')); done([]); });
   }
@@ -331,7 +363,7 @@
       var view = fld('view', 'list');
       var cont = view === 'grid' ? $('<div class="mc-grid"></div>') : list;
       var lastKey = get('last_' + movie.id, '');
-      var playlist = shown.map(function (p) {
+      var playlist = shown.filter(function (p) { return p.url; }).map(function (p) {
         return { title: p.title || movie.title || movie.name, url: p.url, subtitles: p.subtitles, quality: p.quality };
       });
 
@@ -358,8 +390,28 @@
         row.on('hover:focus', function (e) { last = e.target; scroll.update($(e.target), true); });
         row.on('hover:enter', function () {
           set('last_' + movie.id, key); markSeen(key);
-          Lampa.Player.play({ title: title, url: i.url, subtitles: i.subtitles, quality: i.quality, playlist: playlist });
-          Lampa.Player.playlist(playlist);
+          function start(s) {
+            var pl = [{ title: title, url: s.url, subtitles: s.subtitles, quality: s.quality }];
+            Lampa.Player.play({ title: title, url: s.url, subtitles: s.subtitles, quality: s.quality, playlist: pl });
+            Lampa.Player.playlist(pl);
+          }
+          if (!i.resolve) {
+            Lampa.Player.play({ title: title, url: i.url, subtitles: i.subtitles, quality: i.quality, playlist: playlist });
+            Lampa.Player.playlist(playlist);
+            return;
+          }
+          // сериал: поток запрашивается у балансера для конкретной серии
+          Lampa.Noty.show('Загрузка…');
+          i.resolve(function (streams) {
+            if (!streams.length) return Lampa.Noty.show('Балансер не вернул потоков для этой серии');
+            if (streams.length === 1) return start(streams[0]);
+            Lampa.Select.show({
+              title: 'Озвучка / качество',
+              items: streams.map(function (s) { return { title: (s.voice || '') + (s.quality ? ' · ' + s.quality : ''), s: s }; }),
+              onSelect: function (a) { start(a.s); },
+              onBack: function () { Lampa.Controller.toggle('content'); }
+            });
+          });
         });
         row.on('hover:long', function () { self.menu(i, key); });
         cont.append(row);
