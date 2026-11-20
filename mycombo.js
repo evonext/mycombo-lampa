@@ -1,18 +1,18 @@
 /*
- * MyCombo v4 — личный онлайн-плагин для Lampa (Samsung Tizen).
+ * MyCombo v4.1 — личный онлайн-плагин для Lampa (Samsung Tizen).
+ * Установка: https://evonext.github.io/mycombo-lampa/mycombo.js
  *
- * Возможности:
- *  - несколько источников одновременно (свои API + встроенный Internet Archive);
- *  - платные / требующие авторизацию источники и потоки отбрасываются автоматически;
- *  - ТВ-интерфейс: виды «Список» и «Плитки», масштаб, сезоны, озвучки, бейджи 4K/HDR;
- *  - «Продолжить», отметки просмотренного, избранное, сортировка по качеству;
- *  - долгое «ОК» на потоке — быстрое меню;
- *  - загрузка настроек с URL (вместо ввода длинных адресов пультом).
+ * Источники:
+ *  - серверы Lampac (протокол online.js: /lite/events → /lite/{балансер}), по умолчанию rust.bwa.ad;
+ *    балансеры «только для аккаунта» опрашиваются, если включено «Платные»;
+ *  - свои API (контракт ниже) и Internet Archive.
+ * Интерфейс: шапка с постером/актёрами/трейлером, кнопки-фильтры (источник, сезон, озвучка, платные,
+ *   сортировка), серии из TMDB с прогрессом, плейлист сезона с ленивой подгрузкой серий,
+ *   поиск по своему названию, журнал ошибок и диагностика в настройках.
  *
  * Контракт своего API:  GET {api}?title=&year=&imdb=&kp=&tmdb=&type=movie|tv[&season=]
- *   → [{voice, quality, title, url, season, episode, subtitles:[{label,url}],
- *       paid?, auth?}]  (или {items:[...]}). Всё с paid/auth/premium=true отбрасывается.
- * Конфиг по URL (JSON):  {"apis":["https://a/api","https://b/api"],"archive":true}
+ *   → [{voice, quality, title, url, season, episode, subtitles:[{label,url}], paid?, auth?}]  (или {items:[...]})
+ * Конфиг по URL (JSON):  {"apis":[...],"lampac":["https://rust.bwa.ad"],"archive":true,"paid":true}
  */
 (function () {
   'use strict';
@@ -26,7 +26,7 @@
   var TIMEOUT = 20000;
   // Серверы Lampac по умолчанию (можно изменить в настройках). Берутся только бесплатные балансеры.
   var DEFAULT_LAMPAC = 'https://rust.bwa.ad';
-  var VERSION = '4.0';
+  var VERSION = '4.1';
 
   // ---------- журнал ошибок ----------
   var LOG = [];
@@ -100,6 +100,9 @@
       '.mc-prog{height:.3em;margin-top:.55em;border-radius:1em;background:rgba(255,255,255,.2);overflow:hidden}',
       '.mc-prog i{display:block;height:100%;border-radius:1em;background:#e5b73b}',
       '.mc-ep.focus .mc-prog{background:rgba(0,0,0,.15)}',
+      '.mc-miss{color:#ff8a65}',
+      '.mc-ep.focus .mc-miss{color:#c0392b}',
+      '.mc-live{font-size:.95em;opacity:.45;text-transform:none;letter-spacing:0}',
       '.mc-empty{padding:2.5em 1em;text-align:center;font-size:1.5em;opacity:.7}'
     ].join('');
     $('#mc-style').remove();
@@ -111,7 +114,7 @@
     q = (q || '') + '';
     if (/2160|4k|uhd/i.test(q)) return 5;
     if (/1440|2k/i.test(q)) return 4;
-    if (/1080/i.test(q)) return 3;
+    if (/1080|fhd/i.test(q)) return 3;
     if (/720/i.test(q)) return 2;
     if (/480|sd/i.test(q)) return 1;
     return 0;
@@ -136,7 +139,25 @@
   // ---------- здоровье источников ----------
   // Сетевая ошибка / таймаут дважды подряд → источник на 15 минут пропускается. Пустой ответ ошибкой не считается.
   var HEALTH = {}, FORCE = false;
-  var STAT = { done: 0, total: 0 };
+
+  // контекст одного опроса: свой счётчик, своя диагностика, частичные результаты.
+  // У каждого открытого экрана свой контекст, поэтому две карточки подряд не путают данные друг друга.
+  var LASTDIAG = [];
+  function Ctx() {
+    var c = { done: 0, total: 0, diag: [], items: [], onPart: null };
+    c.note = function (m) { c.diag.push(m); LASTDIAG = c.diag; };
+    c.part = function (r) {
+      if (!r || !r.length) return;
+      c.items = c.items.concat(r);
+      try { if (c.onPart) c.onPart(); } catch (e) { log('частичная отрисовка: ' + (e && e.message || e)); } // опрос не должен зависнуть
+    };
+    return c;
+  }
+  // убрать дубли по url (у сериальных источников url нет — их не трогаем)
+  function uniq(list) {
+    var seen = {};
+    return list.filter(function (i) { if (!i.url) return true; if (seen[i.url]) return false; seen[i.url] = 1; return true; });
+  }
   function hGet(k) { return HEALTH[k] || (HEALTH[k] = { fail: 0, t: 0, ms: 0, n: 0 }); }
   function hOk(k, ms) { var h = hGet(k); h.fail = 0; h.ms = h.n ? Math.round((h.ms * h.n + ms) / (h.n + 1)) : ms; h.n++; h.t = Date.now(); }
   function hFail(k) { var h = hGet(k); h.fail++; h.t = Date.now(); }
@@ -159,24 +180,26 @@
   }
 
   // свой API
-  function fromApi(api, movie, season, done) {
+  function fromApi(api, movie, season, done, ctx) {
     var url = api + (api.indexOf('?') > -1 ? '&' : '?') + $.param(query(movie, season));
     request(url, function (j) {
       var d = Array.isArray(j) ? j : (j && j.items) || [];
       d = d.filter(function (i) { return !bad(i); });
       d.forEach(function (i) { i.src = i.src || hostOf(api); });
-      note(hostOf(api) + ': потоков ' + d.length);
+      ctx.note(hostOf(api) + ': потоков ' + d.length);
+      ctx.part(d);
       done(d);
-    }, function (code) { note(hostOf(api) + ': ошибка ' + code); done([], code); }); // 401/402/403 → источник просто пропускается
+    }, function (code) { ctx.note(hostOf(api) + ': ошибка ' + code); done([], code); }); // 401/402/403 → источник просто пропускается
   }
   function hostOf(u) { var m = (u + '').match(/^https?:\/\/([^\/?#]+)/i); return m ? m[1] : 'api'; }
 
   // Internet Archive: бесплатно, без авторизации (в основном общественное достояние)
-  function fromArchive(movie, season, done) {
-    if (movie.name) return done([]); // только фильмы
+  function fromArchive(movie, season, done, ctx) {
+    if (isTv(movie)) return done([]); // только фильмы
+    var note = ctx.note;
     var title = (movie.title || '').replace(/["\\()]/g, ' ').trim();
     var orig = (movie.original_title || '').replace(/["\\()]/g, ' ').trim();
-    var name = orig || title;
+    var name = movie._clar ? title : (orig || title);
     if (!name) return done([]);
     var q = 'title:("' + name + '") AND mediatype:movies';
     var url = 'https://archive.org/advancedsearch.php?q=' + encodeURIComponent(q) +
@@ -201,8 +224,8 @@
               url: 'https://archive.org/download/' + encodeURIComponent(d.identifier) + '/' + encodeURIComponent(f.name)
             });
           });
-          if (!--left) done(out);
-        }, function () { if (!--left) done(out); });
+          if (!--left) { ctx.part(out); done(out); }
+        }, function () { if (!--left) { ctx.part(out); done(out); } });
       });
     }, function () { done([]); });
   }
@@ -226,6 +249,7 @@
     };
     var g = (movie.genres || []).map(function (x) { return x && x.id; }).filter(Boolean).join(',');
     if (g) o.genres = g;
+    if (movie._clar) o.clarification = 1; // название введено вручную (как «уточнить поиск» в online.js)
     for (var k in (extra || {})) o[k] = extra[k];
     Object.keys(o).forEach(function (k) { if (o[k] === undefined || o[k] === null || o[k] === '') delete o[k]; });
     return $.param(o);
@@ -255,10 +279,10 @@
     return out;
   }
 
-  function fromLampac(base, movie, season, done) {
+  function fromLampac(base, movie, season, done, ctx) {
     base = (base + '').replace(/\/+$/, '');
-    var host = hostOf(base);
-    function unit() { STAT.done++; }
+    var host = hostOf(base), note = ctx.note;
+    function unit() { ctx.done++; }
     var orig = movie.original_title || movie.original_name || '';
     // запасной запрос по оригинальному названию, если по русскому ничего не нашлось
     var altMovie = (orig && orig !== (movie.title || movie.name)) ? $.extend({}, movie, movie.name ? { name: orig } : { title: orig }) : null;
@@ -302,7 +326,7 @@
         return done(out);
       }
 
-      STAT.total += bals.length - 1; // вместо одной «единицы» сервера считаем каждый балансер
+      ctx.total += bals.length - 1; // вместо одной «единицы» сервера считаем каждый балансер
       function runMovie(m, retry) {
         var out = [], pending = bals.length;
         function fin() {
@@ -316,9 +340,10 @@
             var r = parseStreams(j, b, host);
             out = out.concat(r);
             note(key + ': потоков ' + r.length + (r.length ? '' : ' · ответ: ' + preview(j)));
-            if (!retry) STAT.done++;
+            if (!retry) ctx.done++;
+            ctx.part(r); // показать сразу, не дожидаясь медленных балансеров
             fin();
-          }, function (code) { note(key + ': ошибка ' + code); if (!retry) STAT.done++; fin(); });
+          }, function (code) { note(key + ': ошибка ' + code); if (!retry) ctx.done++; fin(); });
         });
       }
       runMovie(movie, false);
@@ -326,35 +351,31 @@
   }
 
   var cache = {};
-  var DIAG = [];
-  function note(m) { DIAG.push(m); }
 
-  function collect(movie, season, done) {
-    var key = movie.id + '|' + (season || '') + '|' + fld('apis', '') + '|' + fld('lampac', DEFAULT_LAMPAC) + '|' + fld('archive', true) + '|' + fld('paid', true);
+  // done(all, n) — когда ответили все; ctx.onPart — каждый раз, когда пришла новая порция потоков
+  function collect(movie, season, done, ctx) {
+    var key = [movie.id, movie.title || movie.name, movie._clar ? 1 : 0, season || '', fld('apis', ''), fld('lampac', DEFAULT_LAMPAC), fld('archive', true), fld('paid', true)].join('|');
     var c = cache[key];
-    if (c && Date.now() - c.t < TTL) { DIAG = c.diag || []; return done(c.d, c.n); }
-    DIAG = [];
-    note('MyCombo v' + VERSION);
+    if (c && Date.now() - c.t < TTL) { ctx.diag = c.diag.slice(); LASTDIAG = ctx.diag; ctx.items = c.d; return done(c.d, c.n); }
+    ctx.note('MyCombo v' + VERSION);
 
     var apis = (fld('apis', '') + '').split(/[\s,;]+/).filter(function (x) { return /^https?:\/\//i.test(x); });
-    var tasks = apis.map(function (a) { return { fn: function (cb) { fromApi(a, movie, season, cb); } }; });
+    var tasks = apis.map(function (a) { return { fn: function (cb) { fromApi(a, movie, season, cb, ctx); } }; });
     (fld('lampac', DEFAULT_LAMPAC) + '').split(/[\s,;]+/).filter(function (x) { return /^https?:\/\//i.test(x); }).forEach(function (a) {
-      tasks.push({ own: true, fn: function (cb) { fromLampac(a, movie, season, cb); } }); // сам считает свои единицы прогресса
+      tasks.push({ own: true, fn: function (cb) { fromLampac(a, movie, season, cb, ctx); } }); // сам считает свои единицы прогресса
     });
-    if (fld('archive', true)) tasks.push({ fn: function (cb) { fromArchive(movie, season, cb); } });
+    if (fld('archive', true)) tasks.push({ fn: function (cb) { fromArchive(movie, season, cb, ctx); } });
     if (!tasks.length) return done([], 0);
 
-    STAT.done = 0; STAT.total = tasks.length;
+    ctx.done = 0; ctx.total = tasks.length;
     var all = [], left = tasks.length;
     tasks.forEach(function (t) {
       t.fn(function (d) {
-        if (!t.own) STAT.done++;
+        if (!t.own) ctx.done++;
         all = all.concat(d || []);
         if (--left) return;
-        // убрать дубли по url
-        var seen = {};
-        all = all.filter(function (i) { if (!i.url) return true; if (seen[i.url]) return false; seen[i.url] = 1; return true; });
-        cache[key] = { t: Date.now(), d: all, n: tasks.length, diag: DIAG };
+        all = uniq(all);
+        cache[key] = { t: Date.now(), d: all, n: tasks.length, diag: ctx.diag };
         done(all, tasks.length);
       });
     });
@@ -380,8 +401,18 @@
 
     var movie = object.movie, items = [], sources = [], seasons = [], epCache = {};
     var tv = isTv(movie);
-    var curSrc = get('src', ''), curSeason = object.season || 0, last, self = this, shift = 0;
+    var curSrc = get('src_' + movie.id, ''), curSeason = object.season || 0, last, self = this, shift = 0;
     var actions, lastStreams = null, mainRow = null, needRefresh = false, lastFocusKey = '', keepKey = '', timer = null;
+    // ctx — текущий опрос; dead — экран закрыт (поздние ответы игнорируются); polling — опрос ещё идёт
+    var ctx = Ctx(), dead = false, polling = false, drawn = false, partTimer = null;
+    var resCache = {}, RES_TTL = 10 * 60 * 1000; // ответы по сериям: «серия → потоки всех источников»
+
+    // название для поиска: из карточки или введённое вручную (запоминается для этой карточки)
+    function qmovie() {
+      var q = get('q_' + movie.id, '');
+      if (!q) return movie;
+      return $.extend({}, movie, tv ? { name: q, original_name: q } : { title: q, original_title: q }, { _clar: true });
+    }
 
     // ---- собственная прокрутка (не зависит от Lampa.Scroll) ----
     // Браузер/Lampa может сам прокрутить контейнер при фокусе (overflow:hidden это не запрещает программно),
@@ -447,7 +478,7 @@
     // выбранная озвучка помнится отдельно по каждому сериалу (и общая — как запасная)
     function getPick() { return get('tvpick_' + movie.id, null) || get('tvpick', null); }
     function setPick(s) {
-      var p = s ? { voice: s.voice, quality: s.quality } : '';
+      var p = s ? { voice: s.voice, quality: s.quality, hkey: s.hkey || '' } : '';
       set('tvpick_' + movie.id, p);
       set('tvpick', p);
     }
@@ -502,51 +533,98 @@
       return this.render();
     };
 
-    function stopTimer() { if (timer) { clearInterval(timer); timer = null; } }
+    function stopTimer() { if (timer) { clearInterval(timer); timer = null; } if (partTimer) { clearTimeout(partTimer); partTimer = null; } }
+    function liveText(c) { return 'Ещё отвечают источники: ' + c.done + ' из ' + c.total + '…'; }
+
+    // разложить потоки по источникам/сезонам и отрисовать.
+    // final=false — пришла очередная порция, опрос продолжается: перерисовываем, сохраняя фокус
+    function apply(d, final) {
+      items = d; sources = []; seasons = [];
+      d.forEach(function (i) {
+        var s = i.srcn || i.src || '';
+        if (s && sources.indexOf(s) < 0) sources.push(s);
+        if (i.season && seasons.indexOf(i.season) < 0) seasons.push(i.season);
+      });
+      if (tv) seasons = seasonList();
+      seasons.sort(function (a, b) { return a - b; });
+      if (!curSeason) curSeason = parseInt(get('season_' + movie.id, 0), 10) || seasons[0] || 1;
+      if (seasons.indexOf(curSeason) < 0 && seasons.length) curSeason = seasons[0];
+      // источник, выбранный для этой карточки, мог ещё не ответить — пока опрос идёт, не сбрасываем его
+      var src = curSrc;
+      if (curSrc && sources.indexOf(curSrc) < 0) { src = ''; if (final) curSrc = ''; }
+      var keep = curSrc; curSrc = src;
+      var first = !drawn;
+      drawn = true;
+      if (!first) { keepKey = lastFocusKey; last = false; }
+      self.draw();
+      curSrc = keep;
+      if (first) { self.activity.loader(false); self.activity.toggle(); }
+      else refocus();
+    }
+    // после перерисовки вернуть фокус, но только если управление сейчас у этого экрана (не у меню, не у плеера)
+    function refocus() {
+      try {
+        var a = Lampa.Activity.active && Lampa.Activity.active();
+        if (a && a.activity && a.activity !== self.activity) return;
+        if (Lampa.Controller.enabled().name !== 'content') return;
+        Lampa.Controller.collectionSet(html);
+        Lampa.Controller.collectionFocus(last || false, html);
+      } catch (e) { log('фокус: ' + (e && e.message || e)); }
+    }
+
     this.fetch = function () {
       stopTimer();
+      var my = ctx = Ctx();
+      keepKey = keepKey || lastFocusKey; last = false; // фокус вернётся на ту же кнопку/строку
       this.activity.loader(true);
       bar.empty(); if (actions) actions.empty();
-      var live = true;
-      var show = function () { if (live) list.html('<div class="mc-empty">Опрос источников… ' + STAT.done + ' из ' + STAT.total + '</div>'); };
-      collect(movie, curSeason, safe(function (d, n) {
-        live = false; stopTimer(); FORCE = false;
+      polling = true; drawn = false;
+      var show = function () {
+        if (dead || my !== ctx || !polling) return;
+        if (!drawn) list.html('<div class="mc-empty">Опрос источников… ' + my.done + ' из ' + my.total + '</div>');
+        else list.find('.mc-live').text(liveText(my));
+      };
+      // фильм: показываем первые найденные потоки сразу, остальное дорисовываем не чаще раза в 1,5 с
+      my.onPart = function () {
+        if (dead || my !== ctx || tv || !polling) return;
+        if (!drawn) return apply(uniq(my.items), false);
+        if (partTimer) return;
+        partTimer = setTimeout(function () {
+          partTimer = null;
+          if (!dead && my === ctx && polling) apply(uniq(my.items), false);
+        }, 1500);
+      };
+      collect(qmovie(), curSeason, safe(function (d, n) {
+        if (dead || my !== ctx) return; // экран закрыт или запущен новый опрос
+        polling = false; stopTimer(); FORCE = false;
         self.activity.loader(false);
         if (!n) return self.empty('Нет источников. Укажите адрес API в Настройки → MyCombo или включите Internet Archive');
-        items = d; sources = []; seasons = [];
-        d.forEach(function (i) {
-          var s = i.srcn || i.src || '';
-          if (s && sources.indexOf(s) < 0) sources.push(s);
-          if (i.season && seasons.indexOf(i.season) < 0) seasons.push(i.season);
-        });
-        if (tv) seasons = seasonList();
-        seasons.sort(function (a, b) { return a - b; });
-        if (!curSeason) curSeason = get('season_' + movie.id, 0) || seasons[0] || 1;
-        if (seasons.indexOf(curSeason) < 0 && seasons.length) curSeason = seasons[0];
-        if (curSrc && sources.indexOf(curSrc) < 0) curSrc = '';
-        // curSrc === '' → «все источники»: для сериала поток серии запрашивается у всех балансеров сразу
-        self.draw();
-        self.activity.toggle();
-      }, 'загрузка'));
-      if (live) { show(); timer = setInterval(show, 250); }
+        if (!d.length) { drawn = false; return self.empty(); }
+        apply(d, true);
+      }, 'загрузка'), my);
+      if (polling) { show(); timer = setInterval(show, 250); }
     };
 
     this.empty = function (msg) {
       stopTimer();
       bar.empty(); list.empty();
       if (actions) actions.empty();
-      var dg = DIAG.map(function (l) { return $('<div>').text(l).html(); }).join('<br>');
-      list.append('<div class="mc-empty">' + (msg || 'Ничего не найдено') +
+      var q = get('q_' + movie.id, '');
+      var dg = ctx.diag.map(function (l) { return $('<div>').text(l).html(); }).join('<br>');
+      list.append('<div class="mc-empty">' + (msg || 'Ничего не найдено') + (q ? ' по запросу «' + $('<div>').text(q).html() + '»' : '') +
         (dg ? '<div style="font-size:.6em;margin-top:1.5em;text-align:left;opacity:.8">' + dg + '</div>' : '') + '</div>');
-      // даже на пустом экране есть что нажать: повторить и переключить платные
-      bar.append(button('↻ Повторить', function () { cache = {}; HEALTH = {}; FORCE = true; self.fetch(); }));
-      bar.append(button('Платные: ' + (fld('paid', true) ? 'вкл' : 'выкл'), function () { togglePaid(); }));
+      // даже на пустом экране есть что нажать: повторить, поискать по другому названию, переключить платные
+      bar.append(button('↻ Повторить', function () { cache = {}; HEALTH = {}; FORCE = true; self.fetch(); }, '', '', 'b:retry'));
+      bar.append(searchButton());
+      bar.append(button('Платные: ' + (fld('paid', true) ? 'вкл' : 'выкл'), function () { togglePaid(); }, '', '', 'b:paid'));
+      last = bar.find('.selector')[0];
       this.activity.toggle();
     };
 
-    function button(text, enter, cls, small) {
+    function button(text, enter, cls, small, key) {
       var b = $('<div class="mc-btn selector' + (cls ? ' ' + cls : '') + '"></div>').text(text);
       if (small) b.append($('<small></small>').text(small));
+      if (key) b.data('key', key);
       b.on('hover:enter', safe(enter, 'кнопка'));
       b.on('hover:focus', focusable);
       return b;
@@ -560,13 +638,46 @@
       });
     }
     function redraw() { last = false; self.draw(); self.start(); }
+    function resetData() { epCache = {}; resCache = {}; lastStreams = null; }
     function togglePaid() {
       Lampa.Storage.set(NAME + '_paid', !fld('paid', true));
-      cache = {}; epCache = {}; lastStreams = null;
+      cache = {}; resetData();
       self.fetch();
     }
 
+    // ручной поиск: своё название, если по названию карточки ничего не нашлось или нашлось не то
+    function askSearch() {
+      var cur = get('q_' + movie.id, '') || movie.title || movie.name || '';
+      var done = safe(function (v) {
+        v = ((v === undefined || v === null ? '' : v) + '').trim();
+        var q = v && v !== (movie.title || movie.name) ? v : '';
+        if (q === get('q_' + movie.id, '')) return Lampa.Controller.toggle('content'); // ничего не поменялось
+        set('q_' + movie.id, q);
+        Lampa.Noty.show(q ? 'Поиск: ' + q : 'Поиск по названию карточки');
+        resetData(); keepKey = 'b:search';
+        Lampa.Controller.toggle('content'); // вернуть пульт экрану, пока идёт опрос
+        self.fetch();
+      }, 'поиск');
+      try {
+        if (Lampa.Input && Lampa.Input.edit) return Lampa.Input.edit({ title: 'Название (пусто — как в карточке)', value: cur, free: true, nosave: true }, done);
+      } catch (e) { log('поиск: ' + e.message); }
+      Lampa.Noty.show('Ввод текста на этом устройстве недоступен');
+    }
+    function searchButton() {
+      var q = get('q_' + movie.id, '');
+      return button(q ? 'Поиск: «' + q + '»' : 'Поиск…', askSearch, '', '', 'b:search');
+    }
+
     // ---- данные: сезоны и серии ----
+    // «Сезон 2 · 7/10 ✓» — сколько серий сезона уже просмотрено
+    function seasonTitle(s) {
+      var nums = [];
+      if (epCache[s]) nums = epCache[s].map(function (e) { return e.n; });
+      else (movie.seasons || []).forEach(function (x) { if (x && x.season_number === s) for (var n = 1; n <= (x.episode_count || 0); n++) nums.push(n); });
+      if (!nums.length) return 'Сезон ' + s;
+      var w = nums.filter(function (n) { return pct(tlView(s, n)) >= 90 || isSeen(s + 'x' + n); }).length;
+      return 'Сезон ' + s + ' · ' + w + '/' + nums.length + (w === nums.length ? ' ✓' : '');
+    }
     function seasonList() {
       var a = (movie.seasons || []).filter(function (x) { return x && x.season_number > 0; }).map(function (x) { return x.season_number; });
       if (!a.length && movie.number_of_seasons) for (var n = 1; n <= movie.number_of_seasons; n++) a.push(n);
@@ -576,10 +687,10 @@
       var cnt = 0;
       (movie.seasons || []).forEach(function (x) { if (x && x.season_number === sn) cnt = x.episode_count || 0; });
       function fallback(why) {
-        note('Серии сезона ' + sn + ' не получены из TMDB (' + why + '), показаны 1..' + (cnt || 12));
+        ctx.note('Серии сезона ' + sn + ' не получены из TMDB (' + why + '), показаны 1..' + (cnt || 12));
         var a = [];
         for (var n = 1; n <= (cnt || 12); n++) a.push({ n: n, name: '' });
-        epCache[sn] = a; cb();
+        epCache[sn] = a; if (!dead) cb();
       }
       try {
         if (!Lampa.TMDB || !Lampa.TMDB.api) return fallback('нет Lampa.TMDB');
@@ -590,7 +701,7 @@
             return { n: e.episode_number, name: e.name || '', air: e.air_date || '', runtime: e.runtime || 0, still: e.still_path || '', overview: e.overview || '', vote: e.vote_average || 0 };
           });
           if (!a.length) return fallback('пустой ответ');
-          epCache[sn] = a; cb();
+          epCache[sn] = a; if (!dead) cb();
         }, function (code) { fallback('ошибка ' + code); });
       } catch (e) { fallback('исключение'); }
     }
@@ -610,9 +721,10 @@
       var fast = function (a, b) { return hMs(a.hkey) - hMs(b.hkey); };
       var byQ = function (a, b) { return qRank(b.quality) - qRank(a.quality) || fast(a, b); };
       if (!quality) return c.slice().sort(byQ)[0];
-      var exact = c.filter(function (x) { return x.quality === quality; }).sort(fast)[0];
-      if (exact) return exact;
       var rq = qRank(quality);
+      // «1080», «1080p», «FHD» — одно и то же качество: сравниваем по рангу, а не по строке
+      var exact = c.filter(function (x) { return x.quality === quality || (rq > 0 && qRank(x.quality) === rq); }).sort(fast)[0];
+      if (exact) return exact;
       var lower = c.filter(function (x) { return qRank(x.quality) <= rq; }).sort(byQ)[0];
       return lower || c.slice().sort(function (a, b) { return qRank(a.quality) - qRank(b.quality) || fast(a, b); })[0];
     }
@@ -657,6 +769,9 @@
       var label = function (r) { return name + ' · s' + r.season + 'e' + r.episode + (s.voice ? ' · ' + s.voice : ''); };
       var cur = withExtras({ title: label(g), url: s.url, subtitles: s.subtitles, season: g.season, episode: g.episode, quality: qOrMap(streams, s.voice, s.quality) }, s);
       var v0 = tlView(g.season, g.episode); if (v0) cur.timeline = v0;
+      // следующую серию сначала спрашиваем у того же балансера, что отдал текущую (обычно ответ за 1–2 с),
+      // и только если у него нет нужной озвучки — у всех остальных
+      var pref = { hkey: s.hkey, voice: s.voice };
       var pl = rows.map(function (r) {
         if (r === g) return cur;
         var it = { title: label(r), season: r.season, episode: r.episode };
@@ -667,12 +782,13 @@
             var info = {}, b = list.length ? bestOf(list, s.voice, s.quality, info) : null;
             if (!b) { Lampa.Noty.show('Серия ' + r.episode + ' недоступна у выбранных источников'); try { Lampa.Player.close(); } catch (e) {} return; }
             if (info.voiceMissing) Lampa.Noty.show('Серия ' + r.episode + ': озвучки «' + s.voice + '» нет, взята «' + b.voice + '»');
+            else if (b.hkey) pref.hkey = b.hkey; // дальше держимся источника, который реально отдал серию
             me.url = b.url; me.quality = qOrMap(list, b.voice, b.quality);
             me.title = label(r).replace(s.voice || '', b.voice || '');
             if (b.subtitles) me.subtitles = b.subtitles;
             withExtras(me, b);
             call();
-          });
+          }, pref);
         };
         return it;
       });
@@ -698,6 +814,27 @@
         s.resolveFor(sn, ep, function (r) { if (!done) out = out.concat(r || []); if (!--left) fin(); });
       });
     }
+    // потоки серии: из кэша (10 мин), иначе сначала у «своего» балансера (pref = {hkey, voice}),
+    // а если у него нет нужной озвучки или он молчит 6 с — у всех. cb(list, onlyPref)
+    function resolveEp(srcs, sn, ep, cb, pref) {
+      var ck = sn + 'x' + ep, c = resCache[ck];
+      if (c && Date.now() - c.t < RES_TTL) return cb(c.list, false);
+      var full = function () {
+        resolveAll(srcs, sn, ep, function (list) {
+          if (list.length) resCache[ck] = { t: Date.now(), list: list };
+          cb(list, false);
+        });
+      };
+      var ps = pref && pref.hkey ? srcs.filter(function (s) { return s.hkey === pref.hkey && !hDown(s.hkey); })[0] : null;
+      if (!ps || srcs.length < 2) return full();
+      var done = false, t = setTimeout(function () { if (!done) { done = true; full(); } }, 6000);
+      ps.resolveFor(sn, ep, function (r) {
+        if (done) return; done = true; clearTimeout(t);
+        r = uniq(r || []);
+        if (r.some(function (x) { return !pref.voice || x.voice === pref.voice; })) return cb(r, true);
+        full();
+      });
+    }
     function chooseStream(streams, cb, extra) {
       var multi = {}; streams.forEach(function (x) { if (x.srcn) multi[x.srcn] = 1; });
       var many = Object.keys(multi).length > 1;
@@ -720,14 +857,16 @@
       set('last_' + movie.id, g.key); markSeen(g.key);
       if (g.resolve) {
         Lampa.Noty.show('Загрузка…');
-        return g.resolve(function (streams) {
+        var pick = getPick();
+        return g.resolve(safe(function (streams, onlyPref) {
+          if (dead) return;
           if (!streams.length) return Lampa.Noty.show('Источники не вернули потоков для этой серии');
-          lastStreams = streams;
-          var pick = getPick(), known = pick && streams.some(function (x) { return x.voice === pick.voice; });
+          if (!onlyPref) lastStreams = streams;
+          var known = pick && streams.some(function (x) { return x.voice === pick.voice; });
           if (streams.length === 1) return playSeries(rows, g, streams[0], streams);
           if (known) return playSeries(rows, g, bestOf(streams, pick.voice, pick.quality), streams); // озвучка запомнена
           chooseStream(streams, function (x) { playSeries(rows, g, x, streams); }); // запомненной нет → показываем выбор
-        });
+        }, 'серия'), pick);
       }
       play(title, g.streams ? g.streams[0] : g, g.streams);
     }
@@ -753,6 +892,7 @@
       if (!mainRow) return;
       Lampa.Noty.show('Загрузка озвучек…');
       mainRow.resolve(function (st) {
+        if (dead) return;
         if (!st.length) return Lampa.Noty.show('Источники не вернули озвучки');
         lastStreams = st; cb(st);
       });
@@ -768,14 +908,14 @@
         bar.append(button('Источник: ' + (curSrc || 'все (' + sources.length + ')') + ' ▾', function () {
           var opts = sources.map(function (n) { return { title: tv ? n : n + ' · ' + cnt[n] + ' шт.', value: n, selected: n === curSrc }; });
           opts.unshift({ title: 'Все источники (' + sources.length + ')', value: '', selected: !curSrc });
-          choose('Источник', opts, function (v) { curSrc = v; set('src', v); lastStreams = null; redraw(); });
-        }));
+          choose('Источник', opts, function (v) { curSrc = v; set('src_' + movie.id, v); lastStreams = null; resCache = {}; redraw(); });
+        }, '', '', 'b:src'));
       }
       if (seasons.length > 1) {
         bar.append(button('Сезон ' + curSeason + ' ▾', function () {
-          choose('Сезон', seasons.map(function (s) { return { title: 'Сезон ' + s, value: s, selected: s === curSeason }; }),
+          choose('Сезон', seasons.map(function (s) { return { title: seasonTitle(s), value: s, selected: s === curSeason }; }),
             function (v) { curSeason = v; set('season_' + movie.id, v); redraw(); });
-        }));
+        }, '', '', 'b:season'));
       }
       if (tv) {
         var pk = getPick();
@@ -786,12 +926,13 @@
               redraw();
             }, [{ title: 'Авто — спрашивать при запуске', value: 'auto' }]);
           });
-        }));
+        }, '', '', 'b:voice'));
       }
-      bar.append(button('Платные: ' + (fld('paid', true) ? 'вкл' : 'выкл'), togglePaid));
-      bar.append(button((fld('sort', 'source') === 'quality' ? 'Сортировка: по качеству' : 'Сортировка: как есть') + ' ▾', function () {
+      bar.append(searchButton());
+      bar.append(button('Платные: ' + (fld('paid', true) ? 'вкл' : 'выкл'), togglePaid, '', '', 'b:paid'));
+      if (!tv) bar.append(button((fld('sort', 'source') === 'quality' ? 'Сортировка: по качеству' : 'Сортировка: как есть') + ' ▾', function () {
         Lampa.Storage.set(NAME + '_sort', fld('sort', 'source') === 'quality' ? 'source' : 'quality'); redraw();
-      }));
+      }, '', '', 'b:sort'));
 
       var inSrc = items.filter(function (i) {
         return (!curSrc || (i.srcn || i.src) === curSrc) && (!seasons.length || !i.season || i.season === curSeason);
@@ -804,12 +945,12 @@
           loadEpisodes(curSeason, function () { self.draw(); self.start(); });
           return;
         }
-        var srcList = curSrc ? inSrc : items;
+        var srcList = curSrc ? inSrc : items, sn = curSeason;
         rows = eps.map(function (e) {
           return {
-            episode: e.n, season: curSeason, srcn: curSrc || '', key: curSeason + 'x' + e.n, ep: e,
+            episode: e.n, season: sn, srcn: curSrc || '', key: sn + 'x' + e.n, ep: e,
             title: 'Серия ' + e.n + (e.name ? ' · ' + e.name : ''),
-            resolve: function (cb) { resolveAll(srcList, curSeason, e.n, cb); }
+            resolve: function (cb, pref) { resolveEp(srcList, sn, e.n, cb, pref); }
           };
         });
         rows.forEach(function (r) { r.view = tlView(r.season, r.episode); });
@@ -828,15 +969,17 @@
       // главная кнопка и трейлер в шапке
       var mt = mainTarget(rows);
       mainRow = mt.row;
-      actions.append(button('▶ ' + mt.label, function () { open(mt.row, rows, mt.row.title || movie.title || movie.name); }, 'mc-btn--main', mt.sub));
+      actions.append(button('▶ ' + mt.label, function () { open(mt.row, rows, mt.row.title || movie.title || movie.name); }, 'mc-btn--main', mt.sub, 'main'));
       var tk = trailerKey();
       if (tk) actions.append(button('Трейлер', function () {
         try { if (Lampa.YouTube && Lampa.YouTube.play) return Lampa.YouTube.play(tk); } catch (e) {}
         Lampa.Player.play({ title: 'Трейлер', url: 'https://www.youtube.com/watch?v=' + tk });
-      }));
+      }, '', '', 'trailer'));
       if (!last) last = actions.find('.selector')[0];
 
       list.append('<div class="mc-sect">' + (tv ? 'Сезон ' + curSeason + ' · ' + rows.length + ' сер.' : 'Озвучки · ' + rows.length) + '</div>');
+      if (polling && !tv) list.append($('<div class="mc-sect mc-live"></div>').text(liveText(ctx)));
+      var pick = tv ? getPick() : null;
 
       var lastKey = get('last_' + movie.id, '');
       rows.forEach(function (g) {
@@ -871,6 +1014,11 @@
         } else if (key === lastKey && !tv) {
           body.append($('<div class="mc-ep__st">Последний запуск</div>'));
         }
+        // серия уже запрашивалась, и выбранной озвучки у неё нет — видно сразу, а не только в плеере
+        var rc = tv && pick && pick.voice && resCache[key];
+        if (rc && !rc.list.some(function (x) { return x.voice === pick.voice; })) {
+          body.append($('<div class="mc-ep__st mc-miss"></div>').text('Нет озвучки «' + pick.voice + '»' + (rc.list.length ? ', будет взята другая' : '')));
+        }
         if (fv.indexOf(key) > -1) right.prepend('<span class="mc-ep__ok">★</span>');
         else if (seen) right.prepend('<span class="mc-ep__ok">✓</span>');
         if (tv && sources.length > 1) right.prepend($('<span class="mc-ep__src"></span>').text(g.srcn || ''));
@@ -887,7 +1035,7 @@
         if (rr) last = rr;
       }
       if (keepKey) { // после возврата из плеера остаёмся на той же строке
-        var kk = list.find('.mc-ep').filter(function () { return $(this).data('key') === keepKey; })[0];
+        var kk = html.find('.selector').filter(function () { return $(this).data('key') === keepKey; })[0];
         if (kk) last = kk;
         keepKey = '';
       }
@@ -900,12 +1048,14 @@
       if (g.resolve) opts.push({ title: 'Выбрать озвучку / качество', value: 'tvq' });
       opts.push({ title: isFav ? 'Убрать из избранного' : 'В избранное', value: 'fav' });
       opts.push({ title: isSeen(key) ? 'Снять отметку «просмотрено»' : 'Отметить просмотренным', value: 'seen' });
+      opts.push({ title: 'Искать по другому названию', value: 'search' });
       opts.push({ title: 'Обновить (сбросить пропуски источников)', value: 'reload' });
       choose('MyCombo', opts, function (v) {
         if (v === 'q') return chooseStream(g.streams, function (x) { play(title, x, g.streams); });
         if (v === 'tvq') {
           Lampa.Noty.show('Загрузка…');
           return g.resolve(function (streams) {
+            if (dead) return;
             if (!streams.length) return Lampa.Noty.show('Нет потоков');
             lastStreams = streams;
             chooseStream(streams, function (x) { playSeries(rows, g, x, streams); });
@@ -913,7 +1063,8 @@
         }
         if (v === 'fav') toggleIn('fav_', key);
         if (v === 'seen') toggleIn('seen_', key);
-        if (v === 'reload') { cache = {}; epCache = {}; HEALTH = {}; lastStreams = null; FORCE = true; return self.fetch(); }
+        if (v === 'search') return askSearch();
+        if (v === 'reload') { cache = {}; HEALTH = {}; resetData(); FORCE = true; return self.fetch(); }
         redraw();
       });
     };
@@ -938,7 +1089,7 @@
 
     this.pause = function () {}; this.stop = function () {};
     this.render = function () { return html; };
-    this.destroy = function () { stopTimer(); html.remove(); items = []; };
+    this.destroy = function () { dead = true; polling = false; stopTimer(); ctx.onPart = null; html.remove(); items = []; };
   }
 
   // ---------- настройки: загрузка, экспорт, обновление ----------
@@ -1012,7 +1163,7 @@
   }
   function showLog() { showLines('Журнал ошибок MyCombo', LOG.slice(-20).reverse()); }
   function showDiag() {
-    var lines = DIAG.slice();
+    var lines = LASTDIAG.slice();
     Object.keys(HEALTH).forEach(function (k) {
       var h = HEALTH[k];
       lines.push('здоровье ' + k + ': ' + (h.n ? 'отклик ' + h.ms + ' мс' : 'нет ответов') + (h.fail ? ', подряд ошибок ' + h.fail : ''));
