@@ -36,7 +36,7 @@
     var z = parseFloat(fld('scale', '1')) || 1;
     var css = [
       '.mc-root{position:relative;font-size:' + z + 'em;color:#fff}',
-      '.mc-wrap{position:relative;height:calc(100vh - 6.2em);overflow:hidden}',
+      '.mc-wrap{position:relative;height:calc(100vh - 6.2em);overflow:hidden;overflow:clip}',
       '.mc-inner{position:relative;padding:0 2em 4em 1.5em;transition:transform .28s ease;will-change:transform}',
       '.mc-track{position:absolute;right:.5em;top:.4em;bottom:.4em;width:.28em;border-radius:1em;background:rgba(255,255,255,.12);opacity:0;transition:opacity .3s}',
       '.mc-track.on{opacity:1}',
@@ -322,17 +322,37 @@
     var actions;
 
     // ---- собственная прокрутка (не зависит от Lampa.Scroll) ----
+    // Браузер/Lampa может сам прокрутить контейнер при фокусе (overflow:hidden это не запрещает программно),
+    // и тогда сдвиг складывается с моим transform: верх страницы остаётся обрезанным. Сбрасываем нативную прокрутку.
+    function unscroll() {
+      var n = wrap[0], k = 0;
+      while (n && k++ < 5) {
+        if (n.scrollTop) n.scrollTop = 0;
+        if (n.scrollLeft) n.scrollLeft = 0;
+        n = n.parentElement;
+      }
+    }
+    wrap.on('scroll', unscroll);
+    function setShift(y, max, H, IH) {
+      unscroll();
+      shift = y;
+      inner.css('transform', 'translate3d(0,' + (-shift) + 'px,0)');
+      if (max <= 0) return track.removeClass('on');
+      var TH = track.height(), len = Math.max(TH * 0.08, TH * H / IH);
+      track.addClass('on').find('i').css({ height: len + 'px', top: (TH - len) * (shift / max) + 'px' });
+    }
     function reveal(el) {
       var H = wrap.height(), IH = inner[0].scrollHeight || inner.height();
       var top = 0, n = el;
       while (n && n !== inner[0]) { top += n.offsetTop; n = n.offsetParent; }
-      var max = Math.max(0, IH - H);
-      shift = Math.max(0, Math.min(max, top - H * 0.3));
-      inner.css('transform', 'translate3d(0,' + (-shift) + 'px,0)');
-      var th = track.find('i'), TH = track.height();
-      if (max <= 0) return track.removeClass('on');
-      track.addClass('on');
-      th.css({ height: Math.max(TH * 0.08, TH * H / IH) + 'px', top: (TH - Math.max(TH * 0.08, TH * H / IH)) * (shift / max) + 'px' });
+      var h = el.offsetHeight, max = Math.max(0, IH - H);
+      // элемент целиком помещается без прокрутки (шапка, фильтры, первые серии) → показываем страницу сверху
+      var y = (top + h + 16 <= H) ? 0 : Math.max(0, Math.min(max, top - H * 0.3));
+      setShift(y, max, H, IH);
+    }
+    function toTop() {
+      var H = wrap.height(), IH = inner[0].scrollHeight || inner.height();
+      setShift(0, Math.max(0, IH - H), H, IH);
     }
     function focusable(e) { last = e.target; reveal(e.target); }
 
@@ -724,7 +744,7 @@
           Lampa.Controller.collectionFocus(last || false, html);
           if (last) reveal(last);
         },
-        up: function () { if (Navigator.canmove('up')) Navigator.move('up'); else Lampa.Controller.toggle('head'); },
+        up: function () { if (Navigator.canmove('up')) Navigator.move('up'); else { toTop(); Lampa.Controller.toggle('head'); } },
         down: function () { Navigator.move('down'); },
         left: function () { if (Navigator.canmove('left')) Navigator.move('left'); else Lampa.Controller.toggle('menu'); },
         right: function () { Navigator.move('right'); },
