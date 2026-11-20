@@ -22,6 +22,8 @@
   var NAME = 'mycombo';
   var TTL = 10 * 60 * 1000;
   var TIMEOUT = 12000;
+  // Серверы Lampac по умолчанию (можно изменить в настройках). Берутся только бесплатные балансеры.
+  var DEFAULT_LAMPAC = 'https://rust.bwa.ad';
 
   // ---------- хранилище ----------
   function get(k, d) { var v = Lampa.Storage.get(NAME + '_' + k, ''); return v === '' || v === undefined ? d : v; }
@@ -198,13 +200,13 @@
 
   var cache = {};
   function collect(movie, season, done) {
-    var key = movie.id + '|' + (season || '') + '|' + fld('apis', '') + '|' + fld('lampac', '') + '|' + fld('archive', true);
+    var key = movie.id + '|' + (season || '') + '|' + fld('apis', '') + '|' + fld('lampac', DEFAULT_LAMPAC) + '|' + fld('archive', true);
     var c = cache[key];
     if (c && Date.now() - c.t < TTL) return done(c.d, c.n);
 
     var apis = (fld('apis', '') + '').split(/[\s,;]+/).filter(function (x) { return /^https?:\/\//i.test(x); });
     var tasks = apis.map(function (a) { return function (cb) { fromApi(a, movie, season, cb); }; });
-    (fld('lampac', '') + '').split(/[\s,;]+/).filter(function (x) { return /^https?:\/\//i.test(x); }).forEach(function (a) {
+    (fld('lampac', DEFAULT_LAMPAC) + '').split(/[\s,;]+/).filter(function (x) { return /^https?:\/\//i.test(x); }).forEach(function (a) {
       tasks.push(function (cb) { fromLampac(a, movie, season, cb); });
     });
     if (fld('archive', true)) tasks.push(function (cb) { fromArchive(movie, season, cb); });
@@ -429,7 +431,7 @@
       });
     };
     P('apis', 'input', '', 'Адреса API', 'Один или несколько через пробел. Платные и требующие входа потоки скрываются');
-    P('lampac', 'input', '', 'Серверы Lampac', 'Адреса через пробел (свой сервер). Балансеры «только для аккаунта» и платные пропускаются');
+    P('lampac', 'input', DEFAULT_LAMPAC, 'Серверы Lampac', 'Адреса через пробел (свой сервер). Балансеры «только для аккаунта» и платные пропускаются');
     P('archive', 'trigger', true, 'Internet Archive', 'Бесплатные фильмы без авторизации (в основном общественное достояние)');
     P('view', 'select', 'list', 'Вид', '', { list: 'Список', grid: 'Плитки' });
     P('sort', 'select', 'source', 'Сортировка', '', { source: 'Как у источника', quality: 'По качеству' });
