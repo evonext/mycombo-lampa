@@ -69,6 +69,7 @@
     // платные / с авторизацией / без ссылки
     if (!i || !i.url) return true;
     var f = function (v) { return v === true || v === 1 || v === 'true' || v === '1'; };
+    if (fld('paid', true)) return false; // режим «показывать всё»: решает сервер, при отказе источник пропускается
     if (f(i.paid) || f(i.premium) || f(i.auth) || f(i.need_auth) || f(i.requires_auth) || f(i.login)) return true;
     if (/(^|[?&])(token|apikey|api_key|auth)=\s*(&|$)/i.test(i.url)) return true;
     return false;
@@ -99,8 +100,9 @@
       var d = Array.isArray(j) ? j : (j && j.items) || [];
       d = d.filter(function (i) { return !bad(i); });
       d.forEach(function (i) { i.src = i.src || hostOf(api); });
+      note(hostOf(api) + ': потоков ' + d.length);
       done(d);
-    }, function (code) { done([], code); }); // 401/402/403 → источник просто пропускается
+    }, function (code) { note(hostOf(api) + ': ошибка ' + code); done([], code); }); // 401/402/403 → источник просто пропускается
   }
   function hostOf(u) { var m = (u + '').match(/^https?:\/\/([^\/?#]+)/i); return m ? m[1] : 'api'; }
 
@@ -118,6 +120,7 @@
       var docs = (j && j.response && j.response.docs) || [];
       var year = ((movie.release_date || '') + '').slice(0, 4);
       docs = docs.filter(function (d) { return !year || !d.year || Math.abs(parseInt(d.year, 10) - parseInt(year, 10)) <= 1; });
+      note('archive.org: найдено записей ' + docs.length);
       if (!docs.length) return done([]);
       var out = [], left = docs.length;
       docs.forEach(function (d) {
@@ -152,10 +155,12 @@
     if (season) lq.s = season;
     var out = [], host = hostOf(base);
     request(base + '/lite/events?' + $.param(lq), function (list) {
-      if (!Array.isArray(list)) return done([]);
+      if (typeof list === 'string') { try { list = JSON.parse(list); } catch (e) {} }
+      if (!Array.isArray(list)) { note(host + ': /lite/events вернул не список (' + (typeof list) + ')'); return done([]); }
       var bals = list.filter(function (b) {
-        return b && b.balanser && b.balanser !== 'example' && !b.account_only && !b.paid && !b.need_auth;
-      }).slice(0, 5);
+        return b && b.balanser && b.balanser !== 'example' && (fld('paid', true) || (!b.account_only && !b.paid && !b.need_auth));
+      }).slice(0, 40);
+      note(host + ': балансеров всего ' + list.length + ', к опросу ' + bals.length + (bals.length ? ' (' + bals.map(function (b) { return b.balanser; }).join(', ') + ')' : ''));
       if (!bals.length) return done([]);
       var pending = bals.length;
       function fin() { if (!--pending) done(out); }
@@ -180,7 +185,7 @@
             if (ks.length) { url = quality[ks[0]]; quality = ks[0]; } else quality = '';
           }
           var item = {
-            src: host + '/' + b.balanser, voice: d.voice_name || d.translate || b.name || b.balanser,
+            src: host + '/' + b.balanser, srcn: b.name || b.balanser, voice: d.voice_name || d.translate || b.name || b.balanser,
             quality: quality || d.maxquality || '', title: d.title || d.name || '',
             url: url, subtitles: Array.isArray(d.subtitles) ? d.subtitles.map(function (s) { return { label: s.label, url: s.url }; }) : undefined,
             season: d.season, episode: d.episode
@@ -192,17 +197,22 @@
 
       bals.forEach(function (b) {
         request(base + '/lite/' + encodeURIComponent(b.balanser) + '?' + $.param(lq), function (j) {
-          parse(b, j, 0, fin);
-        }, fin); // 401/402/403 → балансер пропускается
+          var before = out.length;
+          parse(b, j, 0, function () { note(host + '/' + b.balanser + ': потоков ' + (out.length - before)); fin(); });
+        }, function (code) { note(host + '/' + b.balanser + ': ошибка ' + code); fin(); }); // 401/402/403 → балансер пропускается
       });
-    }, function () { done([]); });
+    }, function (code) { note(host + ': /lite/events недоступен, код ' + code + (code === 0 ? ' (сеть/CORS/блокировка)' : '')); done([]); });
   }
 
   var cache = {};
+  var DIAG = [];
+  function note(m) { DIAG.push(m); }
+
   function collect(movie, season, done) {
     var key = movie.id + '|' + (season || '') + '|' + fld('apis', '') + '|' + fld('lampac', DEFAULT_LAMPAC) + '|' + fld('archive', true);
     var c = cache[key];
-    if (c && Date.now() - c.t < TTL) return done(c.d, c.n);
+    if (c && Date.now() - c.t < TTL) { DIAG = c.diag || []; return done(c.d, c.n); }
+    DIAG = [];
 
     var apis = (fld('apis', '') + '').split(/[\s,;]+/).filter(function (x) { return /^https?:\/\//i.test(x); });
     var tasks = apis.map(function (a) { return function (cb) { fromApi(a, movie, season, cb); }; });
@@ -220,7 +230,7 @@
         // убрать дубли по url
         var seen = {};
         all = all.filter(function (i) { if (seen[i.url]) return false; seen[i.url] = 1; return true; });
-        cache[key] = { t: Date.now(), d: all, n: tasks.length };
+        cache[key] = { t: Date.now(), d: all, n: tasks.length, diag: DIAG };
         done(all, tasks.length);
       });
     });
@@ -231,10 +241,11 @@
     var scroll = new Lampa.Scroll({ mask: true, over: true });
     var html = $('<div class="mc-root"></div>');
     var seasonsBox = $('<div class="mc-row"></div>');
+    var srcBox = $('<div class="mc-row"></div>');
     var voicesBox = $('<div class="mc-row"></div>');
     var list = $('<div></div>');
     var movie = object.movie, items = [], voices = [], seasons = [];
-    var curVoice = '', curSeason = object.season || 0, last, self = this;
+    var curVoice = '', curSrc = get('src', ''), sources = [], curSeason = object.season || 0, last, self = this;
 
     function seenKey(i, n) { return (i.season || 0) + 'x' + (i.episode || n); }
     function isSeen(k) { return arr('seen_' + movie.id).indexOf(k) > -1; }
@@ -242,7 +253,7 @@
     function favs() { return arr('fav_' + movie.id); }
 
     this.create = function () {
-      scroll.append(seasonsBox); scroll.append(voicesBox); scroll.append(list);
+      scroll.append(seasonsBox); scroll.append(srcBox); scroll.append(voicesBox); scroll.append(list);
       html.append(scroll.render());
       this.activity.loader(true);
       this.fetch();
@@ -255,23 +266,25 @@
         self.activity.loader(false);
         if (!n) return self.empty('Нет источников. Укажите адрес API в Настройки → MyCombo или включите Internet Archive');
         items = d;
-        voices = []; seasons = [];
+        sources = []; seasons = [];
         d.forEach(function (i) {
-          if (i.voice && voices.indexOf(i.voice) < 0) voices.push(i.voice);
+          var n = i.srcn || i.src || '';
+          if (n && sources.indexOf(n) < 0) sources.push(n);
           if (i.season && seasons.indexOf(i.season) < 0) seasons.push(i.season);
         });
         seasons.sort(function (a, b) { return a - b; });
         if (!curSeason && seasons.length) curSeason = seasons[0];
-        var lv = get('voice', '');
-        curVoice = voices.indexOf(lv) > -1 ? lv : (voices[0] || '');
+        if (curSrc && sources.indexOf(curSrc) < 0) curSrc = '';
         self.draw();
         self.activity.toggle();
       });
     };
 
     this.empty = function (msg) {
-      seasonsBox.empty(); voicesBox.empty();
-      list.empty().append('<div class="mc-empty">' + (msg || 'Ничего не найдено (платные и закрытые источники скрыты)') + '</div>');
+      seasonsBox.empty(); srcBox.empty(); voicesBox.empty();
+      var dg = DIAG.map(function (l) { return $('<div>').text(l).html(); }).join('<br>');
+      list.empty().append('<div class="mc-empty">' + (msg || 'Ничего не найдено (платные и закрытые источники скрыты)') +
+        (dg ? '<div style="font-size:.6em;margin-top:1.5em;text-align:left;opacity:.8">' + dg + '</div>' : '') + '</div>');
       this.activity.toggle();
     };
 
@@ -283,7 +296,19 @@
     }
 
     this.draw = function () {
-      seasonsBox.empty(); voicesBox.empty(); list.empty();
+      seasonsBox.empty(); srcBox.empty(); voicesBox.empty(); list.empty();
+      var inSrc = items.filter(function (i) { return !curSrc || (i.srcn || i.src) === curSrc; });
+      voices = [];
+      inSrc.forEach(function (i) { if (i.voice && voices.indexOf(i.voice) < 0) voices.push(i.voice); });
+      var lv = get('voice', '');
+      if (voices.indexOf(curVoice) < 0) curVoice = voices.indexOf(lv) > -1 ? lv : (voices[0] || '');
+      if (sources.length > 1) {
+        srcBox.append(chip('Все источники (' + sources.length + ')', !curSrc, function () { curSrc = ''; set('src', ''); self.draw(); self.start(); }));
+        sources.forEach(function (n) {
+          var cnt = items.filter(function (i) { return (i.srcn || i.src) === n; }).length;
+          srcBox.append(chip(n + ' · ' + cnt, n === curSrc, function () { curSrc = n; set('src', n); self.draw(); self.start(); }));
+        });
+      }
       seasons.forEach(function (s) {
         if (seasons.length < 2) return;
         seasonsBox.append(chip('Сезон ' + s, s === curSeason, function () { curSeason = s; self.draw(); self.start(); }));
@@ -292,7 +317,7 @@
         voicesBox.append(chip(v, v === curVoice, function () { curVoice = v; set('voice', v); self.draw(); self.start(); }));
       });
 
-      var shown = items.filter(function (i) {
+      var shown = inSrc.filter(function (i) {
         return (!voices.length || i.voice === curVoice) && (!seasons.length || !i.season || i.season === curSeason);
       });
       var sort = fld('sort', 'source');
@@ -300,7 +325,7 @@
       var fv = favs();
       shown.sort(function (a, b) { return (fv.indexOf(b.url) > -1) - (fv.indexOf(a.url) > -1); }); // избранное выше
 
-      if (!shown.length) return this.empty();
+      if (!shown.length) { list.append('<div class="mc-empty">Нет потоков для выбранных фильтров</div>'); return; }
 
       var view = fld('view', 'list');
       var cont = view === 'grid' ? $('<div class="mc-grid"></div>') : list;
@@ -432,6 +457,7 @@
     };
     P('apis', 'input', '', 'Адреса API', 'Один или несколько через пробел. Платные и требующие входа потоки скрываются');
     P('lampac', 'input', DEFAULT_LAMPAC, 'Серверы Lampac', 'Адреса через пробел (свой сервер). Балансеры «только для аккаунта» и платные пропускаются');
+    P('paid', 'trigger', true, 'Все балансеры, включая платные', 'Не скрывать источники «только для аккаунта». Если сервер откажет — источник просто пропускается');
     P('archive', 'trigger', true, 'Internet Archive', 'Бесплатные фильмы без авторизации (в основном общественное достояние)');
     P('view', 'select', 'list', 'Вид', '', { list: 'Список', grid: 'Плитки' });
     P('sort', 'select', 'source', 'Сортировка', '', { source: 'Как у источника', quality: 'По качеству' });
