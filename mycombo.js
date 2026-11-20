@@ -358,15 +358,54 @@
       return out;
     }
 
-    function play(title, s) {
-      var pl = [{ title: title, url: s.url, subtitles: s.subtitles, quality: s.quality }];
-      Lampa.Player.play({ title: title, url: s.url, subtitles: s.subtitles, quality: s.quality, playlist: pl });
+    function qualityMap(streams, voice) {
+      var m = {};
+      streams.forEach(function (x) { if ((!voice || x.voice === voice) && x.quality && !m[x.quality]) m[x.quality] = x.url; });
+      return m;
+    }
+    function bestOf(streams, voice, quality) {
+      var c = streams.filter(function (x) { return !voice || x.voice === voice; });
+      if (!c.length) c = streams;
+      var same = quality ? c.filter(function (x) { return x.quality === quality; })[0] : null;
+      return same || c.slice().sort(function (x, y) { return qRank(y.quality) - qRank(x.quality); })[0];
+    }
+    function play(title, s, all) {
+      var qm = all ? qualityMap(all, s.voice) : {};
+      var q = Object.keys(qm).length > 1 ? qm : s.quality;
+      var cur = { title: title, url: s.url, subtitles: s.subtitles, quality: q };
+      Lampa.Player.play(cur);
+      Lampa.Player.playlist([cur]);
+    }
+    // сериал: плейлист всего сезона, серии запрашиваются «лениво», когда плеер до них доходит
+    function playSeries(rows, g, s, streams) {
+      set('tvpick', { voice: s.voice, quality: s.quality });
+      var name = movie.title || movie.name;
+      var label = function (r) { return name + ' · s' + r.season + 'e' + r.episode + (s.voice ? ' · ' + s.voice : ''); };
+      var qm = qualityMap(streams, s.voice);
+      var cur = { title: label(g), url: s.url, subtitles: s.subtitles, season: g.season, episode: g.episode, quality: Object.keys(qm).length > 1 ? qm : s.quality };
+      var pl = rows.map(function (r) {
+        if (r === g) return cur;
+        var it = { title: label(r), season: r.season, episode: r.episode };
+        it.url = function (call) {
+          var me = (this && this.episode === r.episode) ? this : it;
+          r.resolve(function (list) {
+            var b = list.length ? bestOf(list, s.voice, s.quality) : null;
+            if (!b) { Lampa.Noty.show('Серия ' + r.episode + ' недоступна у этого источника'); try { Lampa.Player.close(); } catch (e) {} return; }
+            var m2 = qualityMap(list, b.voice);
+            me.url = b.url; me.quality = Object.keys(m2).length > 1 ? m2 : b.quality;
+            if (b.subtitles) me.subtitles = b.subtitles;
+            call();
+          });
+        };
+        return it;
+      });
+      Lampa.Player.play(cur);
       Lampa.Player.playlist(pl);
     }
-    function pickStream(title, streams) {
-      choose('Озвучка / качество', streams.map(function (s) {
-        return { title: (s.voice ? s.voice + ' · ' : '') + (s.quality || 'auto'), value: s };
-      }), function (s) { play(title, s); });
+    function chooseStream(streams, cb) {
+      choose('Озвучка / качество', streams.map(function (x) {
+        return { title: (x.voice ? x.voice + ' · ' : '') + (x.quality || 'auto'), value: x };
+      }), cb);
     }
 
     function seasonList() {
@@ -472,33 +511,43 @@
         row.on('hover:focus', function (e) { last = e.target; scroll.update($(e.target), true); });
         row.on('hover:enter', function () {
           set('last_' + movie.id, key); markSeen(key);
-          if (g.resolve) { // сериал: поток запрашивается для конкретной серии
+          if (g.resolve) { // сериал: поток запрашивается для конкретной серии, дальше плейлист сезона
             Lampa.Noty.show('Загрузка…');
             return g.resolve(function (streams) {
               if (!streams.length) return Lampa.Noty.show('Балансер не вернул потоков для этой серии');
-              if (streams.length === 1) return play(title, streams[0]);
-              pickStream(title, streams);
+              var pick = get('tvpick', null), ask = pick && streams.some(function (x) { return x.voice === pick.voice; });
+              if (streams.length === 1) return playSeries(rows, g, streams[0], streams);
+              if (ask) return playSeries(rows, g, bestOf(streams, pick.voice, pick.quality), streams); // озвучка запомнена
+              chooseStream(streams, function (x) { playSeries(rows, g, x, streams); });
             });
           }
-          play(title, g.streams ? g.streams[0] : g); // фильм: лучшее качество сразу
+          play(title, g.streams ? g.streams[0] : g, g.streams); // фильм: лучшее качество сразу
         });
-        row.on('hover:long', function () { self.menu(g, key, title); });
+        row.on('hover:long', function () { self.menu(g, key, title, rows); });
         cont.append(row);
         if (key === lastKey && !last) last = row[0];
       });
       if (view === 'grid') list.append(cont);
     };
 
-    this.menu = function (g, key, title) {
+    this.menu = function (g, key, title, rows) {
       var fv = favs(), isFav = fv.indexOf(key) > -1;
       var opts = [];
       if (g.streams && g.streams.length > 1) opts.push({ title: 'Выбрать качество (' + g.streams.length + ')', value: 'q' });
+      if (g.resolve) opts.push({ title: 'Выбрать озвучку / качество', value: 'tvq' });
       opts.push({ title: isFav ? 'Убрать из избранного' : 'В избранное', value: 'fav' });
       opts.push({ title: isSeen(key) ? 'Снять отметку «просмотрено»' : 'Отметить просмотренным', value: 'seen' });
       opts.push({ title: 'Вид: ' + (fld('view', 'list') === 'list' ? 'плитки' : 'список'), value: 'view' });
       opts.push({ title: 'Обновить', value: 'reload' });
       choose('MyCombo', opts, function (v) {
-        if (v === 'q') return pickStream(title, g.streams);
+        if (v === 'q') return chooseStream(g.streams, function (x) { play(title, x, g.streams); });
+        if (v === 'tvq') {
+          Lampa.Noty.show('Загрузка…');
+          return g.resolve(function (streams) {
+            if (!streams.length) return Lampa.Noty.show('Нет потоков');
+            chooseStream(streams, function (x) { playSeries(rows, g, x, streams); });
+          });
+        }
         if (v === 'fav') toggleIn('fav_', key);
         if (v === 'seen') toggleIn('seen_', key);
         if (v === 'view') Lampa.Storage.set(NAME + '_view', fld('view', 'list') === 'list' ? 'grid' : 'list');
