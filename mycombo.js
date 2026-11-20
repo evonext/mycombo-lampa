@@ -296,6 +296,7 @@
     }
 
     this.draw = function () {
+      if (!items.length) return this.empty();
       seasonsBox.empty(); srcBox.empty(); voicesBox.empty(); list.empty();
       var inSrc = items.filter(function (i) { return !curSrc || (i.srcn || i.src) === curSrc; });
       voices = [];
