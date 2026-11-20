@@ -1,0 +1,4 @@
+{
+  "apis": ["https://example.com/api/online"],
+  "archive": true
+}
