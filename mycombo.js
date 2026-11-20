@@ -137,14 +137,76 @@
     }, function () { done([]); });
   }
 
+  // Сервер, совместимый с Lampac (/lite/events → список балансеров → /lite/{balanser}).
+  // Берутся только балансеры без account_only/paid; всё платное и привязанное к аккаунту отбрасывается.
+  function fromLampac(base, movie, season, done) {
+    base = (base + '').replace(/\/+$/, '');
+    var q = query(movie, season);
+    var lq = {
+      id: movie.id, imdb_id: q.imdb, kinopoisk_id: q.kp, title: q.title,
+      original_title: movie.original_title || movie.original_name || '',
+      serial: movie.name ? 1 : 0, year: q.year, source: 'tmdb', rjson: 'true'
+    };
+    if (season) lq.s = season;
+    var out = [], host = hostOf(base);
+    request(base + '/lite/events?' + $.param(lq), function (list) {
+      if (!Array.isArray(list)) return done([]);
+      var bals = list.filter(function (b) {
+        return b && b.balanser && b.balanser !== 'example' && !b.account_only && !b.paid && !b.need_auth;
+      }).slice(0, 5);
+      if (!bals.length) return done([]);
+      var pending = bals.length;
+      function fin() { if (!--pending) done(out); }
+
+      function parse(b, j, depth, cb) {
+        if (typeof j === 'string') { try { j = JSON.parse(j); } catch (e) { return cb(); } }
+        var data = j && j.data;
+        if (!Array.isArray(data)) return cb();
+        var waiting = 1;
+        function end() { if (!--waiting) cb(); }
+        data.forEach(function (d) {
+          if (!d || !d.url) return;
+          if (d.method === 'link' && depth < 2) {
+            waiting++;
+            request(d.url, function (r) { parse(b, r, depth + 1, end); }, end);
+            return;
+          }
+          if (d.method && d.method !== 'play') return;
+          var url = d.url, quality = d.quality;
+          if (quality && typeof quality === 'object') { // {"1080p": url, ...} → лучшее
+            var ks = Object.keys(quality).sort(function (a, c) { return qRank(c) - qRank(a); });
+            if (ks.length) { url = quality[ks[0]]; quality = ks[0]; } else quality = '';
+          }
+          var item = {
+            src: host + '/' + b.balanser, voice: d.voice_name || d.translate || b.name || b.balanser,
+            quality: quality || d.maxquality || '', title: d.title || d.name || '',
+            url: url, subtitles: Array.isArray(d.subtitles) ? d.subtitles.map(function (s) { return { label: s.label, url: s.url }; }) : undefined,
+            season: d.season, episode: d.episode
+          };
+          if (!bad(item)) out.push(item);
+        });
+        end();
+      }
+
+      bals.forEach(function (b) {
+        request(base + '/lite/' + encodeURIComponent(b.balanser) + '?' + $.param(lq), function (j) {
+          parse(b, j, 0, fin);
+        }, fin); // 401/402/403 → балансер пропускается
+      });
+    }, function () { done([]); });
+  }
+
   var cache = {};
   function collect(movie, season, done) {
-    var key = movie.id + '|' + (season || '') + '|' + fld('apis', '') + '|' + fld('archive', true);
+    var key = movie.id + '|' + (season || '') + '|' + fld('apis', '') + '|' + fld('lampac', '') + '|' + fld('archive', true);
     var c = cache[key];
     if (c && Date.now() - c.t < TTL) return done(c.d, c.n);
 
     var apis = (fld('apis', '') + '').split(/[\s,;]+/).filter(function (x) { return /^https?:\/\//i.test(x); });
     var tasks = apis.map(function (a) { return function (cb) { fromApi(a, movie, season, cb); }; });
+    (fld('lampac', '') + '').split(/[\s,;]+/).filter(function (x) { return /^https?:\/\//i.test(x); }).forEach(function (a) {
+      tasks.push(function (cb) { fromLampac(a, movie, season, cb); });
+    });
     if (fld('archive', true)) tasks.push(function (cb) { fromArchive(movie, season, cb); });
     if (!tasks.length) return done([], 0);
 
@@ -329,6 +391,7 @@
       try {
         if (typeof j === 'string') j = JSON.parse(j);
         if (j.apis) Lampa.Storage.set(NAME + '_apis', [].concat(j.apis).join(' '));
+        if (j.lampac) Lampa.Storage.set(NAME + '_lampac', [].concat(j.lampac).join(' '));
         if (typeof j.archive === 'boolean') Lampa.Storage.set(NAME + '_archive', j.archive);
         cache = {};
         Lampa.Noty.show('MyCombo: настройки загружены');
@@ -366,6 +429,7 @@
       });
     };
     P('apis', 'input', '', 'Адреса API', 'Один или несколько через пробел. Платные и требующие входа потоки скрываются');
+    P('lampac', 'input', '', 'Серверы Lampac', 'Адреса через пробел (свой сервер). Балансеры «только для аккаунта» и платные пропускаются');
     P('archive', 'trigger', true, 'Internet Archive', 'Бесплатные фильмы без авторизации (в основном общественное достояние)');
     P('view', 'select', 'list', 'Вид', '', { list: 'Список', grid: 'Плитки' });
     P('sort', 'select', 'source', 'Сортировка', '', { source: 'Как у источника', quality: 'По качеству' });
