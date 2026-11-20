@@ -203,21 +203,18 @@
       var out = [];
 
       if (isTv(movie)) {
-        // сериал: серии берутся из TMDB, поток запрашивается при выборе серии
-        var seasons = (movie.seasons || []).filter(function (s) { return s && s.season_number > 0 && s.episode_count > 0; });
-        if (!seasons.length) seasons = [{ season_number: 1, episode_count: 12 }];
+        // сериал: серии берутся из TMDB в интерфейсе, поток запрашивается при выборе серии
         bals.forEach(function (b) {
-          seasons.forEach(function (s) {
-            for (var e = 1; e <= s.episode_count; e++) (function (sn, ep) {
-              out.push({
-                src: host + '/' + b.balanser, srcn: b.name || b.balanser, voice: b.name || b.balanser,
-                season: sn, episode: ep, title: 'Серия ' + ep,
-                resolve: function (cb) {
-                  request(base + '/lite/' + encodeURIComponent(b.balanser) + '?' + lcParams(movie, { season: sn, episode: ep }),
-                    function (j) { cb(parseStreams(j, b, host)); }, function () { cb([]); });
-                }
-              });
-            })(s.season_number, e);
+          out.push({
+            src: host + '/' + b.balanser, srcn: b.name || b.balanser, tvsrc: true,
+            resolveFor: function (sn, ep, cb) {
+              request(base + '/lite/' + encodeURIComponent(b.balanser) + '?' + lcParams(movie, { season: sn, episode: ep }),
+                function (j) {
+                  var r = parseStreams(j, b, host);
+                  if (!r.length) note(host + '/' + b.balanser + ' s' + sn + 'e' + ep + ': ответ ' + preview(j));
+                  cb(r);
+                }, function (code) { note(host + '/' + b.balanser + ': ошибка ' + code); cb([]); });
+            }
           });
         });
         note(host + ': сериал, потоки запрашиваются при выборе серии');
@@ -263,7 +260,7 @@
         if (--left) return;
         // убрать дубли по url
         var seen = {};
-        all = all.filter(function (i) { if (seen[i.url]) return false; seen[i.url] = 1; return true; });
+        all = all.filter(function (i) { if (!i.url) return true; if (seen[i.url]) return false; seen[i.url] = 1; return true; });
         cache[key] = { t: Date.now(), d: all, n: tasks.length, diag: DIAG };
         done(all, tasks.length);
       });
@@ -278,7 +275,7 @@
     var list = $('<div></div>');
     var movie = object.movie, items = [], sources = [], seasons = [];
     var tv = isTv(movie);
-    var curSrc = get('src', ''), curSeason = object.season || 0, last, self = this;
+    var curSrc = get('src', ''), curSeason = object.season || 0, last, self = this, epCache = {};
 
     function keyOf(i) { return i.episode ? (i.season || 0) + 'x' + i.episode : 'v:' + (i.srcn || '') + '|' + (i.voice || ''); }
     function isSeen(k) { return arr('seen_' + movie.id).indexOf(k) > -1; }
@@ -309,8 +306,10 @@
           if (s && sources.indexOf(s) < 0) sources.push(s);
           if (i.season && seasons.indexOf(i.season) < 0) seasons.push(i.season);
         });
+        if (tv) seasons = seasonList();
         seasons.sort(function (a, b) { return a - b; });
-        if (!curSeason && seasons.length) curSeason = seasons[0];
+        if (!curSeason) curSeason = get('season_' + movie.id, 0) || seasons[0] || 1;
+        if (seasons.indexOf(curSeason) < 0 && seasons.length) curSeason = seasons[0];
         if (curSrc && sources.indexOf(curSrc) < 0) curSrc = '';
         if (tv && !curSrc) curSrc = sources[0] || ''; // у сериала серии берутся у одного источника
         self.draw();
@@ -370,6 +369,32 @@
       }), function (s) { play(title, s); });
     }
 
+    function seasonList() {
+      var a = (movie.seasons || []).filter(function (x) { return x && x.season_number > 0; }).map(function (x) { return x.season_number; });
+      if (!a.length && movie.number_of_seasons) for (var n = 1; n <= movie.number_of_seasons; n++) a.push(n);
+      return a.length ? a : [1];
+    }
+    function loadEpisodes(sn, cb) {
+      var cnt = 0;
+      (movie.seasons || []).forEach(function (x) { if (x && x.season_number === sn) cnt = x.episode_count || 0; });
+      function fallback(why) {
+        note('Серии сезона ' + sn + ' не получены из TMDB (' + why + '), показаны 1..' + (cnt || 12));
+        var a = [];
+        for (var n = 1; n <= (cnt || 12); n++) a.push({ n: n, name: '' });
+        epCache[sn] = a; cb();
+      }
+      try {
+        if (!Lampa.TMDB || !Lampa.TMDB.api) return fallback('нет Lampa.TMDB');
+        var lang = Lampa.Storage.field('tmdb_lang') || Lampa.Storage.field('language') || 'ru';
+        var url = Lampa.TMDB.api('tv/' + movie.id + '/season/' + sn + '?api_key=' + Lampa.TMDB.key() + '&language=' + lang);
+        request(url, function (j) {
+          var a = ((j && j.episodes) || []).map(function (e) { return { n: e.episode_number, name: e.name || '' }; });
+          if (!a.length) return fallback('пустой ответ');
+          epCache[sn] = a; cb();
+        }, function (code) { fallback('ошибка ' + code); });
+      } catch (e) { fallback('исключение'); }
+    }
+
     this.draw = function () {
       if (!items.length) return this.empty();
       bar.empty(); list.empty();
@@ -378,7 +403,7 @@
       if (sources.length > 1) {
         var cnt = {}; items.forEach(function (i) { var s = i.srcn || i.src; cnt[s] = (cnt[s] || 0) + 1; });
         bar.append(button('Источник: ' + (curSrc || 'все (' + sources.length + ')') + ' ▾', function () {
-          var opts = sources.map(function (n) { return { title: n + ' · ' + (tv ? '' : cnt[n] + ' шт.'), value: n, selected: n === curSrc }; });
+          var opts = sources.map(function (n) { return { title: tv ? n : n + ' · ' + cnt[n] + ' шт.', value: n, selected: n === curSrc }; });
           if (!tv) opts.unshift({ title: 'Все источники (' + sources.length + ')', value: '', selected: !curSrc });
           choose('Источник', opts, function (v) { curSrc = v; set('src', v); redraw(); });
         }));
@@ -386,7 +411,7 @@
       if (seasons.length > 1) {
         bar.append(button('Сезон ' + curSeason + ' ▾', function () {
           choose('Сезон', seasons.map(function (s) { return { title: 'Сезон ' + s, value: s, selected: s === curSeason }; }),
-            function (v) { curSeason = v; redraw(); });
+            function (v) { curSeason = v; set('season_' + movie.id, v); redraw(); });
         }));
       }
       bar.append(button((fld('sort', 'source') === 'quality' ? 'Сортировка: по качеству' : 'Сортировка: как у источника') + ' ▾', function () {
@@ -396,7 +421,23 @@
       var inSrc = items.filter(function (i) {
         return (!curSrc || (i.srcn || i.src) === curSrc) && (!seasons.length || !i.season || i.season === curSeason);
       });
-      var rows = tv ? inSrc.map(function (i) { i.key = keyOf(i); return i; }) : groupVoices(inSrc);
+      var rows;
+      if (tv) {
+        var eps = epCache[curSeason];
+        if (!eps) {
+          list.append('<div class="mc-empty">Загрузка серий…</div>');
+          loadEpisodes(curSeason, function () { self.draw(); self.start(); });
+          return;
+        }
+        var src = inSrc[0] || items[0];
+        rows = eps.map(function (e) {
+          return {
+            episode: e.n, season: curSeason, srcn: src.srcn, key: curSeason + 'x' + e.n,
+            title: 'Серия ' + e.n + (e.name ? ' · ' + e.name : ''),
+            resolve: function (cb) { src.resolveFor(curSeason, e.n, cb); }
+          };
+        });
+      } else rows = groupVoices(inSrc);
       if (!rows.length) { list.append('<div class="mc-empty">Нет вариантов для выбранного источника</div>'); return; }
 
       if (fld('sort', 'source') === 'quality' && !tv) rows.sort(function (a, b) { return qRank(b.quality) - qRank(a.quality); });
