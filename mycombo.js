@@ -1,5 +1,5 @@
 /*
- * MyCombo v2 — личный онлайн-плагин для Lampa (Samsung Tizen).
+ * MyCombo v4 — личный онлайн-плагин для Lampa (Samsung Tizen).
  *
  * Возможности:
  *  - несколько источников одновременно (свои API + встроенный Internet Archive);
@@ -16,6 +16,8 @@
  */
 (function () {
   'use strict';
+  // адрес, с которого Lampa загрузила этот файл (нужен для проверки обновлений); доступен только при первом запуске скрипта
+  var SELF_URL = (function () { try { return (document.currentScript && document.currentScript.src) || ''; } catch (e) { return ''; } })();
   if (window.mycombo_ready) return;
   window.mycombo_ready = true;
 
@@ -24,6 +26,21 @@
   var TIMEOUT = 20000;
   // Серверы Lampac по умолчанию (можно изменить в настройках). Берутся только бесплатные балансеры.
   var DEFAULT_LAMPAC = 'https://rust.bwa.ad';
+  var VERSION = '4.0';
+
+  // ---------- журнал ошибок ----------
+  var LOG = [];
+  function log(m) { LOG.push(new Date().toLocaleTimeString() + ' ' + m); if (LOG.length > 60) LOG.shift(); }
+  // обёртка: любая ошибка внутри обработчика не роняет экран, а попадает в журнал (Настройки → MyCombo → Журнал ошибок)
+  function safe(fn, where) {
+    return function () {
+      try { return fn.apply(this, arguments); }
+      catch (e) {
+        log(where + ': ' + (e && e.message || e));
+        try { Lampa.Noty.show('MyCombo: ошибка (' + where + '), подробности в журнале'); } catch (_) {}
+      }
+    };
+  }
 
   // ---------- хранилище ----------
   function get(k, d) { var v = Lampa.Storage.get(NAME + '_' + k, ''); return v === '' || v === undefined ? d : v; }
@@ -43,7 +60,7 @@
       '.mc-track i{position:absolute;left:0;right:0;top:0;border-radius:1em;background:rgba(255,255,255,.65)}',
 
       /* шапка */
-      '.mc-hero{display:flex;padding:.8em 0 1em}',
+      '.mc-hero{display:flex;margin:.4em 0 .8em;padding:1em 1.2em;border-radius:1em;background:rgba(255,255,255,.05) center/cover no-repeat}',
       '.mc-poster{flex:none;width:9.5em;height:14em;border-radius:.7em;background:rgba(255,255,255,.08) center/cover no-repeat;box-shadow:0 .4em 1.4em rgba(0,0,0,.45)}',
       '.mc-info{flex:1;min-width:0;margin-left:1.6em;display:flex;flex-direction:column}',
       '.mc-title{font-size:2.3em;font-weight:700;line-height:1.1}',
@@ -52,6 +69,8 @@
       '.mc-meta span{margin-right:1em;opacity:.85}',
       '.mc-meta .mc-rate{padding:.05em .55em;border-radius:.4em;background:#e5b73b;color:#000;font-weight:700;opacity:1}',
       '.mc-desc{margin-top:.8em;font-size:1.1em;line-height:1.45;opacity:.8;max-width:46em;display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden}',
+      '.mc-cast{margin-top:.6em;font-size:1em;opacity:.65}',
+      '.mc-next{margin-top:.35em;font-size:1em;color:#e5b73b}',
       '.mc-actions{display:flex;flex-wrap:wrap;margin-top:auto;padding-top:1em}',
 
       /* кнопки и фильтры */
@@ -112,6 +131,20 @@
     var net = new Lampa.Reguest();
     net.timeout(TIMEOUT);
     net.silent(url, ok, function (a, st) { fail(a && a.status || st || 0); });
+  }
+
+  // ---------- здоровье источников ----------
+  // Сетевая ошибка / таймаут дважды подряд → источник на 15 минут пропускается. Пустой ответ ошибкой не считается.
+  var HEALTH = {}, FORCE = false;
+  var STAT = { done: 0, total: 0 };
+  function hGet(k) { return HEALTH[k] || (HEALTH[k] = { fail: 0, t: 0, ms: 0, n: 0 }); }
+  function hOk(k, ms) { var h = hGet(k); h.fail = 0; h.ms = h.n ? Math.round((h.ms * h.n + ms) / (h.n + 1)) : ms; h.n++; h.t = Date.now(); }
+  function hFail(k) { var h = hGet(k); h.fail++; h.t = Date.now(); }
+  function hDown(k) { var h = HEALTH[k]; return !FORCE && !!(h && h.fail >= 2 && Date.now() - h.t < 15 * 60 * 1000); }
+  function hMs(k) { var h = HEALTH[k]; return h && h.n ? h.ms : 99999; }
+  function trequest(key, url, ok, fail) {
+    var t0 = Date.now();
+    request(url, function (j) { hOk(key, Date.now() - t0); ok(j); }, function (c) { hFail(key); fail(c); });
   }
 
   function query(movie, season) {
@@ -207,7 +240,7 @@
     st.forEach(function (s) {
       if (!s || !s.url) return;
       var item = {
-        src: host + '/' + b.balanser, srcn: b.name || b.balanser,
+        src: host + '/' + b.balanser, srcn: b.name || b.balanser, hkey: host + '/' + b.balanser,
         voice: ((s.voice || '') + '').trim() || b.name || b.balanser,
         quality: s.quality || '', url: s.url
       };
@@ -215,6 +248,8 @@
         item.subtitles = s.subtitles.filter(function (x) { return x && x.url; })
           .map(function (x) { return { label: x.label || x.name || x.lang || 'sub', url: x.url }; });
       }
+      // если балансер отдаёт тайминги заставки — передаём плееру как есть (кнопка «Пропустить» в плеере Lampa)
+      if (s.segments) item.segments = s.segments;
       if (!bad(item)) out.push(item);
     });
     return out;
@@ -223,46 +258,71 @@
   function fromLampac(base, movie, season, done) {
     base = (base + '').replace(/\/+$/, '');
     var host = hostOf(base);
-    request(base + '/lite/events?' + lcParams(movie), function (list) {
+    function unit() { STAT.done++; }
+    var orig = movie.original_title || movie.original_name || '';
+    // запасной запрос по оригинальному названию, если по русскому ничего не нашлось
+    var altMovie = (orig && orig !== (movie.title || movie.name)) ? $.extend({}, movie, movie.name ? { name: orig } : { title: orig }) : null;
+
+    trequest(host + '/events', base + '/lite/events?' + lcParams(movie), function (list) {
       if (typeof list === 'string') { try { list = JSON.parse(list); } catch (e) {} }
-      if (!Array.isArray(list)) { note(host + ': /lite/events вернул не список: ' + preview(list)); return done([]); }
-      var bals = list.filter(function (b) {
+      if (!Array.isArray(list)) { note(host + ': /lite/events вернул не список: ' + preview(list)); unit(); return done([]); }
+      var all = list.filter(function (b) {
         return b && b.balanser && b.balanser !== 'example' && (fld('paid', true) || (!b.account_only && !b.paid && !b.need_auth));
       }).slice(0, 40);
-      note(host + ': балансеров всего ' + list.length + ', к опросу ' + bals.length + (bals.length ? ' (' + bals.map(function (b) { return b.balanser; }).join(', ') + ')' : ''));
-      if (!bals.length) return done([]);
-      var out = [];
+      var down = all.filter(function (b) { return hDown(host + '/' + b.balanser); });
+      var bals = all.filter(function (b) { return !hDown(host + '/' + b.balanser); });
+      note(host + ': балансеров всего ' + list.length + ', к опросу ' + bals.length +
+        (bals.length ? ' (' + bals.map(function (b) { return b.balanser; }).join(', ') + ')' : '') +
+        (down.length ? ', пропущено недоступных ' + down.length + ' (' + down.map(function (b) { return b.balanser; }).join(', ') + ')' : ''));
+      if (!bals.length) { unit(); return done([]); }
 
       if (isTv(movie)) {
         // сериал: серии берутся из TMDB в интерфейсе, поток запрашивается при выборе серии
+        var out = [];
         bals.forEach(function (b) {
+          var key = host + '/' + b.balanser;
           out.push({
-            src: host + '/' + b.balanser, srcn: b.name || b.balanser, tvsrc: true,
+            src: key, srcn: b.name || b.balanser, hkey: key, tvsrc: true,
             resolveFor: function (sn, ep, cb) {
-              request(base + '/lite/' + encodeURIComponent(b.balanser) + '?' + lcParams(movie, { season: sn, episode: ep }),
-                function (j) {
-                  var r = parseStreams(j, b, host);
-                  if (!r.length) note(host + '/' + b.balanser + ' s' + sn + 'e' + ep + ': ответ ' + preview(j));
-                  cb(r);
-                }, function (code) { note(host + '/' + b.balanser + ': ошибка ' + code); cb([]); });
+              function go(m, retry) {
+                trequest(key, base + '/lite/' + encodeURIComponent(b.balanser) + '?' + lcParams(m, { season: sn, episode: ep }),
+                  function (j) {
+                    var r = parseStreams(j, b, host);
+                    if (!r.length && !retry && altMovie) return go(altMovie, true);
+                    if (!r.length) note(key + ' s' + sn + 'e' + ep + ': ответ ' + preview(j));
+                    cb(r);
+                  }, function (code) { note(key + ': ошибка ' + code); cb([]); });
+              }
+              go(movie, false);
             }
           });
         });
         note(host + ': сериал, потоки запрашиваются при выборе серии');
+        unit();
         return done(out);
       }
 
-      var pending = bals.length;
-      function fin() { if (!--pending) done(out); }
-      bals.forEach(function (b) {
-        request(base + '/lite/' + encodeURIComponent(b.balanser) + '?' + lcParams(movie), function (j) {
-          var r = parseStreams(j, b, host);
-          out = out.concat(r);
-          note(host + '/' + b.balanser + ': потоков ' + r.length + (r.length ? '' : ' · ответ: ' + preview(j)));
-          fin();
-        }, function (code) { note(host + '/' + b.balanser + ': ошибка ' + code); fin(); });
-      });
-    }, function (code) { note(host + ': /lite/events недоступен, код ' + code + (code === 0 ? ' (сеть/CORS/блокировка)' : '')); done([]); });
+      STAT.total += bals.length - 1; // вместо одной «единицы» сервера считаем каждый балансер
+      function runMovie(m, retry) {
+        var out = [], pending = bals.length;
+        function fin() {
+          if (--pending) return;
+          if (!out.length && !retry && altMovie) { note(host + ': повтор по оригинальному названию «' + orig + '»'); return runMovie(altMovie, true); }
+          done(out);
+        }
+        bals.forEach(function (b) {
+          var key = host + '/' + b.balanser;
+          trequest(key, base + '/lite/' + encodeURIComponent(b.balanser) + '?' + lcParams(m), function (j) {
+            var r = parseStreams(j, b, host);
+            out = out.concat(r);
+            note(key + ': потоков ' + r.length + (r.length ? '' : ' · ответ: ' + preview(j)));
+            if (!retry) STAT.done++;
+            fin();
+          }, function (code) { note(key + ': ошибка ' + code); if (!retry) STAT.done++; fin(); });
+        });
+      }
+      runMovie(movie, false);
+    }, function (code) { note(host + ': /lite/events недоступен, код ' + code + (code === 0 ? ' (сеть/CORS/блокировка)' : '')); unit(); done([]); });
   }
 
   var cache = {};
@@ -270,23 +330,25 @@
   function note(m) { DIAG.push(m); }
 
   function collect(movie, season, done) {
-    var key = movie.id + '|' + (season || '') + '|' + fld('apis', '') + '|' + fld('lampac', DEFAULT_LAMPAC) + '|' + fld('archive', true);
+    var key = movie.id + '|' + (season || '') + '|' + fld('apis', '') + '|' + fld('lampac', DEFAULT_LAMPAC) + '|' + fld('archive', true) + '|' + fld('paid', true);
     var c = cache[key];
     if (c && Date.now() - c.t < TTL) { DIAG = c.diag || []; return done(c.d, c.n); }
     DIAG = [];
-    note('MyCombo v3 (разбор streams)');
+    note('MyCombo v' + VERSION);
 
     var apis = (fld('apis', '') + '').split(/[\s,;]+/).filter(function (x) { return /^https?:\/\//i.test(x); });
-    var tasks = apis.map(function (a) { return function (cb) { fromApi(a, movie, season, cb); }; });
+    var tasks = apis.map(function (a) { return { fn: function (cb) { fromApi(a, movie, season, cb); } }; });
     (fld('lampac', DEFAULT_LAMPAC) + '').split(/[\s,;]+/).filter(function (x) { return /^https?:\/\//i.test(x); }).forEach(function (a) {
-      tasks.push(function (cb) { fromLampac(a, movie, season, cb); });
+      tasks.push({ own: true, fn: function (cb) { fromLampac(a, movie, season, cb); } }); // сам считает свои единицы прогресса
     });
-    if (fld('archive', true)) tasks.push(function (cb) { fromArchive(movie, season, cb); });
+    if (fld('archive', true)) tasks.push({ fn: function (cb) { fromArchive(movie, season, cb); } });
     if (!tasks.length) return done([], 0);
 
+    STAT.done = 0; STAT.total = tasks.length;
     var all = [], left = tasks.length;
     tasks.forEach(function (t) {
-      t(function (d) {
+      t.fn(function (d) {
+        if (!t.own) STAT.done++;
         all = all.concat(d || []);
         if (--left) return;
         // убрать дубли по url
@@ -319,7 +381,7 @@
     var movie = object.movie, items = [], sources = [], seasons = [], epCache = {};
     var tv = isTv(movie);
     var curSrc = get('src', ''), curSeason = object.season || 0, last, self = this, shift = 0;
-    var actions;
+    var actions, lastStreams = null, mainRow = null, needRefresh = false, lastFocusKey = '', keepKey = '', timer = null;
 
     // ---- собственная прокрутка (не зависит от Lampa.Scroll) ----
     // Браузер/Lampa может сам прокрутить контейнер при фокусе (overflow:hidden это не запрещает программно),
@@ -354,7 +416,7 @@
       var H = wrap.height(), IH = inner[0].scrollHeight || inner.height();
       setShift(0, Math.max(0, IH - H), H, IH);
     }
-    function focusable(e) { last = e.target; reveal(e.target); }
+    function focusable(e) { last = e.target; lastFocusKey = $(e.target).data('key') || ''; reveal(e.target); }
 
     // ---- таймлайн Lampa (прогресс просмотра, «продолжить») ----
     function tlHash(season, episode) {
@@ -382,7 +444,25 @@
       set(name + movie.id, a);
     }
 
+    // выбранная озвучка помнится отдельно по каждому сериалу (и общая — как запасная)
+    function getPick() { return get('tvpick_' + movie.id, null) || get('tvpick', null); }
+    function setPick(s) {
+      var p = s ? { voice: s.voice, quality: s.quality } : '';
+      set('tvpick_' + movie.id, p);
+      set('tvpick', p);
+    }
+
+    function dateText(d) {
+      if (!d) return '';
+      try { return new Date(d).toLocaleDateString('ru-RU', { day: 'numeric', month: 'long', year: 'numeric' }); } catch (e) { return d; }
+    }
+
     // ---- шапка с информацией ----
+    function trailerKey() {
+      var v = (object.videos && object.videos.results) || (movie.videos && movie.videos.results) || [];
+      var t = v.filter(function (x) { return x && x.site === 'YouTube' && x.key && /trailer|teaser/i.test(x.type || ''); })[0] || v.filter(function (x) { return x && x.site === 'YouTube' && x.key; })[0];
+      return t ? t.key : '';
+    }
     function buildHero() {
       var m = movie, year = ((m.release_date || m.first_air_date || '') + '').slice(0, 4);
       var rt = m.runtime || (m.episode_run_time && m.episode_run_time[0]) || 0;
@@ -394,16 +474,22 @@
       if (rt) meta.push('<span>' + rt + ' мин</span>');
       if (gen) meta.push('<span></span>');
       hero.empty();
+      var back = tmdbImg('w780', m.backdrop_path);
+      if (back) hero.css('background-image', 'linear-gradient(90deg,rgba(18,14,12,.94) 0%,rgba(18,14,12,.7) 55%,rgba(18,14,12,.35) 100%),url(' + back + ')');
       var poster = $('<div class="mc-poster"></div>');
       var img = tmdbImg('w342', m.poster_path);
       if (img) poster.css('background-image', 'url(' + img + ')');
-      var info = $('<div class="mc-info"><div class="mc-title"></div><div class="mc-orig"></div><div class="mc-meta"></div><div class="mc-desc"></div></div>');
+      var info = $('<div class="mc-info"><div class="mc-title"></div><div class="mc-orig"></div><div class="mc-meta"></div><div class="mc-desc"></div><div class="mc-cast"></div><div class="mc-next"></div></div>');
       info.find('.mc-title').text(m.title || m.name || '');
       var orig = m.original_title || m.original_name || '';
       info.find('.mc-orig').text(orig && orig !== (m.title || m.name) ? orig : '').toggle(!!(orig && orig !== (m.title || m.name)));
       info.find('.mc-meta').html(meta.join(''));
       if (gen) info.find('.mc-meta span').last().text(gen);
       info.find('.mc-desc').text(m.overview || '');
+      var cast = ((object.persons && object.persons.cast) || (m.credits && m.credits.cast) || []).map(function (c) { return c && c.name; }).filter(Boolean).slice(0, 4);
+      info.find('.mc-cast').text(cast.length ? 'В ролях: ' + cast.join(', ') : '').toggle(!!cast.length);
+      var ne = m.next_episode_to_air;
+      info.find('.mc-next').text(ne && ne.air_date ? 'Следующая серия выйдет ' + dateText(ne.air_date) : '').toggle(!!(ne && ne.air_date));
       actions = $('<div class="mc-actions"></div>');
       info.append(actions);
       hero.append(poster).append(info);
@@ -416,9 +502,15 @@
       return this.render();
     };
 
+    function stopTimer() { if (timer) { clearInterval(timer); timer = null; } }
     this.fetch = function () {
+      stopTimer();
       this.activity.loader(true);
-      collect(movie, curSeason, function (d, n) {
+      bar.empty(); if (actions) actions.empty();
+      var live = true;
+      var show = function () { if (live) list.html('<div class="mc-empty">Опрос источников… ' + STAT.done + ' из ' + STAT.total + '</div>'); };
+      collect(movie, curSeason, safe(function (d, n) {
+        live = false; stopTimer(); FORCE = false;
         self.activity.loader(false);
         if (!n) return self.empty('Нет источников. Укажите адрес API в Настройки → MyCombo или включите Internet Archive');
         items = d; sources = []; seasons = [];
@@ -432,25 +524,30 @@
         if (!curSeason) curSeason = get('season_' + movie.id, 0) || seasons[0] || 1;
         if (seasons.indexOf(curSeason) < 0 && seasons.length) curSeason = seasons[0];
         if (curSrc && sources.indexOf(curSrc) < 0) curSrc = '';
-        if (tv && !curSrc) curSrc = sources[0] || ''; // у сериала серии берутся у одного источника
+        // curSrc === '' → «все источники»: для сериала поток серии запрашивается у всех балансеров сразу
         self.draw();
         self.activity.toggle();
-      });
+      }, 'загрузка'));
+      if (live) { show(); timer = setInterval(show, 250); }
     };
 
     this.empty = function (msg) {
+      stopTimer();
       bar.empty(); list.empty();
       if (actions) actions.empty();
       var dg = DIAG.map(function (l) { return $('<div>').text(l).html(); }).join('<br>');
       list.append('<div class="mc-empty">' + (msg || 'Ничего не найдено') +
         (dg ? '<div style="font-size:.6em;margin-top:1.5em;text-align:left;opacity:.8">' + dg + '</div>' : '') + '</div>');
+      // даже на пустом экране есть что нажать: повторить и переключить платные
+      bar.append(button('↻ Повторить', function () { cache = {}; HEALTH = {}; FORCE = true; self.fetch(); }));
+      bar.append(button('Платные: ' + (fld('paid', true) ? 'вкл' : 'выкл'), function () { togglePaid(); }));
       this.activity.toggle();
     };
 
     function button(text, enter, cls, small) {
       var b = $('<div class="mc-btn selector' + (cls ? ' ' + cls : '') + '"></div>').text(text);
       if (small) b.append($('<small></small>').text(small));
-      b.on('hover:enter', enter);
+      b.on('hover:enter', safe(enter, 'кнопка'));
       b.on('hover:focus', focusable);
       return b;
     }
@@ -463,6 +560,11 @@
       });
     }
     function redraw() { last = false; self.draw(); self.start(); }
+    function togglePaid() {
+      Lampa.Storage.set(NAME + '_paid', !fld('paid', true));
+      cache = {}; epCache = {}; lastStreams = null;
+      self.fetch();
+    }
 
     // ---- данные: сезоны и серии ----
     function seasonList() {
@@ -485,16 +587,12 @@
         var url = Lampa.TMDB.api('tv/' + movie.id + '/season/' + sn + '?api_key=' + Lampa.TMDB.key() + '&language=' + lang);
         request(url, function (j) {
           var a = ((j && j.episodes) || []).map(function (e) {
-            return { n: e.episode_number, name: e.name || '', air: e.air_date || '', runtime: e.runtime || 0, still: e.still_path || '', overview: e.overview || '' };
+            return { n: e.episode_number, name: e.name || '', air: e.air_date || '', runtime: e.runtime || 0, still: e.still_path || '', overview: e.overview || '', vote: e.vote_average || 0 };
           });
           if (!a.length) return fallback('пустой ответ');
           epCache[sn] = a; cb();
         }, function (code) { fallback('ошибка ' + code); });
       } catch (e) { fallback('исключение'); }
-    }
-    function dateText(s) {
-      if (!s) return '';
-      try { return new Date(s).toLocaleDateString('ru-RU', { day: 'numeric', month: 'long', year: 'numeric' }); } catch (e) { return s; }
     }
 
     // ---- потоки ----
@@ -503,11 +601,20 @@
       streams.forEach(function (x) { if ((!voice || x.voice === voice) && x.quality && !m[x.quality]) m[x.quality] = x.url; });
       return m;
     }
-    function bestOf(streams, voice, quality) {
-      var c = streams.filter(function (x) { return !voice || x.voice === voice; });
+    // подбор потока: нужная озвучка, затем качество — точное, иначе ближайшее не выше, иначе ближайшее выше;
+    // среди равных берётся источник, который отвечает быстрее
+    function bestOf(streams, voice, quality, info) {
+      var c = voice ? streams.filter(function (x) { return x.voice === voice; }) : streams;
+      if (info) info.voiceMissing = !!voice && !c.length;
       if (!c.length) c = streams;
-      var same = quality ? c.filter(function (x) { return x.quality === quality; })[0] : null;
-      return same || c.slice().sort(function (x, y) { return qRank(y.quality) - qRank(x.quality); })[0];
+      var fast = function (a, b) { return hMs(a.hkey) - hMs(b.hkey); };
+      var byQ = function (a, b) { return qRank(b.quality) - qRank(a.quality) || fast(a, b); };
+      if (!quality) return c.slice().sort(byQ)[0];
+      var exact = c.filter(function (x) { return x.quality === quality; }).sort(fast)[0];
+      if (exact) return exact;
+      var rq = qRank(quality);
+      var lower = c.filter(function (x) { return qRank(x.quality) <= rq; }).sort(byQ)[0];
+      return lower || c.slice().sort(function (a, b) { return qRank(a.quality) - qRank(b.quality) || fast(a, b); })[0];
     }
     function qOrMap(streams, voice, fallbackQ) {
       var m = qualityMap(streams, voice);
@@ -530,20 +637,25 @@
     }
     function keyOf(i) { return i.episode ? (i.season || 0) + 'x' + i.episode : 'v:' + (i.srcn || '') + '|' + (i.voice || ''); }
 
+    function withExtras(o, s) {
+      if (s.segments) o.segments = s.segments;
+      return o;
+    }
     function play(title, s, all) {
-      history();
-      var cur = { title: title, url: s.url, subtitles: s.subtitles, quality: all ? qOrMap(all, s.voice, s.quality) : s.quality };
+      history(); needRefresh = true;
+      var cur = withExtras({ title: title, url: s.url, subtitles: s.subtitles, quality: all ? qOrMap(all, s.voice, s.quality) : s.quality }, s);
       var v = tlView(0, 0); if (v) cur.timeline = v;
       Lampa.Player.play(cur);
       Lampa.Player.playlist([cur]);
     }
-    // сериал: плейлист всего сезона, серии запрашиваются «лениво», когда плеер до них доходит
+    // сериал: плейлист всего сезона, серии запрашиваются «лениво», когда плеер до них доходит.
+    // Переход на следующую серию, таймер и отметки просмотра ведёт сам плеер Lampa и её таймлайн.
     function playSeries(rows, g, s, streams) {
-      history();
-      set('tvpick', { voice: s.voice, quality: s.quality });
+      history(); needRefresh = true;
+      setPick(s);
       var name = movie.title || movie.name;
       var label = function (r) { return name + ' · s' + r.season + 'e' + r.episode + (s.voice ? ' · ' + s.voice : ''); };
-      var cur = { title: label(g), url: s.url, subtitles: s.subtitles, season: g.season, episode: g.episode, quality: qOrMap(streams, s.voice, s.quality) };
+      var cur = withExtras({ title: label(g), url: s.url, subtitles: s.subtitles, season: g.season, episode: g.episode, quality: qOrMap(streams, s.voice, s.quality) }, s);
       var v0 = tlView(g.season, g.episode); if (v0) cur.timeline = v0;
       var pl = rows.map(function (r) {
         if (r === g) return cur;
@@ -552,10 +664,13 @@
         it.url = function (call) {
           var me = (this && this.episode === r.episode) ? this : it;
           r.resolve(function (list) {
-            var b = list.length ? bestOf(list, s.voice, s.quality) : null;
-            if (!b) { Lampa.Noty.show('Серия ' + r.episode + ' недоступна у этого источника'); try { Lampa.Player.close(); } catch (e) {} return; }
+            var info = {}, b = list.length ? bestOf(list, s.voice, s.quality, info) : null;
+            if (!b) { Lampa.Noty.show('Серия ' + r.episode + ' недоступна у выбранных источников'); try { Lampa.Player.close(); } catch (e) {} return; }
+            if (info.voiceMissing) Lampa.Noty.show('Серия ' + r.episode + ': озвучки «' + s.voice + '» нет, взята «' + b.voice + '»');
             me.url = b.url; me.quality = qOrMap(list, b.voice, b.quality);
+            me.title = label(r).replace(s.voice || '', b.voice || '');
             if (b.subtitles) me.subtitles = b.subtitles;
+            withExtras(me, b);
             call();
           });
         };
@@ -564,10 +679,40 @@
       Lampa.Player.play(cur);
       Lampa.Player.playlist(pl);
     }
-    function chooseStream(streams, cb) {
-      choose('Озвучка / качество', streams.map(function (x) {
-        return { title: (x.voice ? x.voice + ' · ' : '') + (x.quality || 'auto'), value: x };
-      }), cb);
+
+    // запрос серии у нескольких балансеров параллельно; ждём всех, но не дольше 9 секунд.
+    // Недоступные источники пропускаются, одинаковые ссылки склеиваются, потоки сортируются по скорости отклика.
+    function resolveAll(srcs, sn, ep, cb) {
+      var live = srcs.filter(function (s) { return !hDown(s.hkey); });
+      if (!live.length) live = srcs;
+      var out = [], left = live.length, done = false, t = null;
+      function fin() {
+        if (done) return; done = true; clearTimeout(t);
+        var seen = {};
+        out = out.filter(function (x) { if (seen[x.url]) return false; seen[x.url] = 1; return true; });
+        cb(out);
+      }
+      if (!left) return fin();
+      t = setTimeout(fin, 9000);
+      live.forEach(function (s) {
+        s.resolveFor(sn, ep, function (r) { if (!done) out = out.concat(r || []); if (!--left) fin(); });
+      });
+    }
+    function chooseStream(streams, cb, extra) {
+      var multi = {}; streams.forEach(function (x) { if (x.srcn) multi[x.srcn] = 1; });
+      var many = Object.keys(multi).length > 1;
+      // у одинаковых озвучка+качество из разных источников отмечаем самый быстрый
+      var fastest = {};
+      streams.forEach(function (x) {
+        var k = x.voice + '|' + x.quality;
+        if (!fastest[k] || hMs(x.hkey) < hMs(fastest[k].hkey)) fastest[k] = x;
+      });
+      var cnt = {}; streams.forEach(function (x) { var k = x.voice + '|' + x.quality; cnt[k] = (cnt[k] || 0) + 1; });
+      var opts = streams.map(function (x) {
+        var k = x.voice + '|' + x.quality;
+        return { title: (x.voice ? x.voice + ' · ' : '') + (x.quality || 'auto') + (many && x.srcn ? ' · ' + x.srcn : '') + (cnt[k] > 1 && fastest[k] === x ? ' ⚡' : ''), value: x };
+      });
+      choose('Озвучка / качество', (extra || []).concat(opts), cb);
     }
 
     // запуск строки (серия или озвучка фильма)
@@ -576,11 +721,12 @@
       if (g.resolve) {
         Lampa.Noty.show('Загрузка…');
         return g.resolve(function (streams) {
-          if (!streams.length) return Lampa.Noty.show('Балансер не вернул потоков для этой серии');
-          var pick = get('tvpick', null), known = pick && streams.some(function (x) { return x.voice === pick.voice; });
+          if (!streams.length) return Lampa.Noty.show('Источники не вернули потоков для этой серии');
+          lastStreams = streams;
+          var pick = getPick(), known = pick && streams.some(function (x) { return x.voice === pick.voice; });
           if (streams.length === 1) return playSeries(rows, g, streams[0], streams);
           if (known) return playSeries(rows, g, bestOf(streams, pick.voice, pick.quality), streams); // озвучка запомнена
-          chooseStream(streams, function (x) { playSeries(rows, g, x, streams); });
+          chooseStream(streams, function (x) { playSeries(rows, g, x, streams); }); // запомненной нет → показываем выбор
         });
       }
       play(title, g.streams ? g.streams[0] : g, g.streams);
@@ -601,7 +747,18 @@
       return { row: row, label: p > 2 && p < 90 ? 'Продолжить' : 'Смотреть', sub: row.title };
     }
 
-    this.draw = function () {
+    // список озвучек для кнопки «Озвучка»: берём последний ответ или запрашиваем главную серию
+    function voiceChoices(cb) {
+      if (lastStreams && lastStreams.length) return cb(lastStreams);
+      if (!mainRow) return;
+      Lampa.Noty.show('Загрузка озвучек…');
+      mainRow.resolve(function (st) {
+        if (!st.length) return Lampa.Noty.show('Источники не вернули озвучки');
+        lastStreams = st; cb(st);
+      });
+    }
+
+    this.draw = safe(function () {
       if (!items.length) return this.empty();
       buildHero(); bar.empty(); list.empty();
 
@@ -610,8 +767,8 @@
         var cnt = {}; items.forEach(function (i) { var s = i.srcn || i.src; cnt[s] = (cnt[s] || 0) + 1; });
         bar.append(button('Источник: ' + (curSrc || 'все (' + sources.length + ')') + ' ▾', function () {
           var opts = sources.map(function (n) { return { title: tv ? n : n + ' · ' + cnt[n] + ' шт.', value: n, selected: n === curSrc }; });
-          if (!tv) opts.unshift({ title: 'Все источники (' + sources.length + ')', value: '', selected: !curSrc });
-          choose('Источник', opts, function (v) { curSrc = v; set('src', v); redraw(); });
+          opts.unshift({ title: 'Все источники (' + sources.length + ')', value: '', selected: !curSrc });
+          choose('Источник', opts, function (v) { curSrc = v; set('src', v); lastStreams = null; redraw(); });
         }));
       }
       if (seasons.length > 1) {
@@ -620,6 +777,18 @@
             function (v) { curSeason = v; set('season_' + movie.id, v); redraw(); });
         }));
       }
+      if (tv) {
+        var pk = getPick();
+        bar.append(button('Озвучка: ' + (pk ? pk.voice + (pk.quality ? ' · ' + pk.quality : '') : 'авто') + ' ▾', function () {
+          voiceChoices(function (st) {
+            chooseStream(st, function (v) {
+              if (v === 'auto') { setPick(null); Lampa.Noty.show('Озвучка: выбор при запуске'); } else { setPick(v); Lampa.Noty.show('Озвучка: ' + v.voice); }
+              redraw();
+            }, [{ title: 'Авто — спрашивать при запуске', value: 'auto' }]);
+          });
+        }));
+      }
+      bar.append(button('Платные: ' + (fld('paid', true) ? 'вкл' : 'выкл'), togglePaid));
       bar.append(button((fld('sort', 'source') === 'quality' ? 'Сортировка: по качеству' : 'Сортировка: как есть') + ' ▾', function () {
         Lampa.Storage.set(NAME + '_sort', fld('sort', 'source') === 'quality' ? 'source' : 'quality'); redraw();
       }));
@@ -635,12 +804,12 @@
           loadEpisodes(curSeason, function () { self.draw(); self.start(); });
           return;
         }
-        var src = inSrc[0] || items[0];
+        var srcList = curSrc ? inSrc : items;
         rows = eps.map(function (e) {
           return {
-            episode: e.n, season: curSeason, srcn: src.srcn, key: curSeason + 'x' + e.n, ep: e,
+            episode: e.n, season: curSeason, srcn: curSrc || '', key: curSeason + 'x' + e.n, ep: e,
             title: 'Серия ' + e.n + (e.name ? ' · ' + e.name : ''),
-            resolve: function (cb) { src.resolveFor(curSeason, e.n, cb); }
+            resolve: function (cb) { resolveAll(srcList, curSeason, e.n, cb); }
           };
         });
         rows.forEach(function (r) { r.view = tlView(r.season, r.episode); });
@@ -656,9 +825,15 @@
       rows.forEach(function (r, n) { r._i = n; });
       rows.sort(function (a, b) { return ((fv.indexOf(b.key) > -1) - (fv.indexOf(a.key) > -1)) || (a._i - b._i); });
 
-      // главная кнопка в шапке
+      // главная кнопка и трейлер в шапке
       var mt = mainTarget(rows);
+      mainRow = mt.row;
       actions.append(button('▶ ' + mt.label, function () { open(mt.row, rows, mt.row.title || movie.title || movie.name); }, 'mc-btn--main', mt.sub));
+      var tk = trailerKey();
+      if (tk) actions.append(button('Трейлер', function () {
+        try { if (Lampa.YouTube && Lampa.YouTube.play) return Lampa.YouTube.play(tk); } catch (e) {}
+        Lampa.Player.play({ title: 'Трейлер', url: 'https://www.youtube.com/watch?v=' + tk });
+      }));
       if (!last) last = actions.find('.selector')[0];
 
       list.append('<div class="mc-sect">' + (tv ? 'Сезон ' + curSeason + ' · ' + rows.length + ' сер.' : 'Озвучки · ' + rows.length) + '</div>');
@@ -667,7 +842,7 @@
       rows.forEach(function (g) {
         var key = g.key;
         var title = g.title || movie.title || movie.name;
-        var row = $('<div class="mc-ep selector"></div>');
+        var row = $('<div class="mc-ep selector"></div>').data('key', key);
         var body = $('<div class="mc-ep__body"><div class="mc-ep__t"></div><div class="mc-ep__s"></div></div>');
         body.find('.mc-ep__t').text(title);
         var right = $('<div class="mc-ep__r"></div>');
@@ -680,7 +855,7 @@
           if (still) img.css('background-image', 'url(' + still + ')');
           row.append(img);
           body.find('.mc-ep__t').text(e.name ? e.name : 'Серия ' + g.episode);
-          body.find('.mc-ep__s').text([dateText(e.air), e.runtime ? e.runtime + ' мин' : ''].filter(Boolean).join(' · '));
+          body.find('.mc-ep__s').text([dateText(e.air), e.runtime ? e.runtime + ' мин' : '', e.vote > 0 ? '★ ' + Number(e.vote).toFixed(1) : ''].filter(Boolean).join(' · '));
           if (e.overview) body.append($('<div class="mc-ep__d"></div>').text(e.overview));
         } else {
           var quals = [];
@@ -702,16 +877,21 @@
 
         row.append(body).append(right);
         row.on('hover:focus', focusable);
-        row.on('hover:enter', function () { open(g, rows, tv ? (movie.title || movie.name) + ' · s' + g.season + 'e' + g.episode : title); });
-        row.on('hover:long', function () { self.menu(g, key, title, rows); });
+        row.on('hover:enter', safe(function () { open(g, rows, tv ? (movie.title || movie.name) + ' · s' + g.season + 'e' + g.episode : title); }, 'запуск'));
+        row.on('hover:long', safe(function () { self.menu(g, key, title, rows); }, 'меню'));
         list.append(row);
         if (key === lastKey && !last) last = row[0];
       });
-      if (tv && mt && mt.row) { // фокус сразу на нужной серии, если шапка не в фокусе
+      if (tv && mt && mt.row) { // фокус сразу на нужной серии
         var rr = list.find('.mc-ep')[rows.indexOf(mt.row)];
         if (rr) last = rr;
       }
-    };
+      if (keepKey) { // после возврата из плеера остаёмся на той же строке
+        var kk = list.find('.mc-ep').filter(function () { return $(this).data('key') === keepKey; })[0];
+        if (kk) last = kk;
+        keepKey = '';
+      }
+    }, 'отрисовка');
 
     this.menu = function (g, key, title, rows) {
       var fv = favs(), isFav = fv.indexOf(key) > -1;
@@ -720,26 +900,29 @@
       if (g.resolve) opts.push({ title: 'Выбрать озвучку / качество', value: 'tvq' });
       opts.push({ title: isFav ? 'Убрать из избранного' : 'В избранное', value: 'fav' });
       opts.push({ title: isSeen(key) ? 'Снять отметку «просмотрено»' : 'Отметить просмотренным', value: 'seen' });
-      opts.push({ title: 'Обновить', value: 'reload' });
+      opts.push({ title: 'Обновить (сбросить пропуски источников)', value: 'reload' });
       choose('MyCombo', opts, function (v) {
         if (v === 'q') return chooseStream(g.streams, function (x) { play(title, x, g.streams); });
         if (v === 'tvq') {
           Lampa.Noty.show('Загрузка…');
           return g.resolve(function (streams) {
             if (!streams.length) return Lampa.Noty.show('Нет потоков');
+            lastStreams = streams;
             chooseStream(streams, function (x) { playSeries(rows, g, x, streams); });
           });
         }
         if (v === 'fav') toggleIn('fav_', key);
         if (v === 'seen') toggleIn('seen_', key);
-        if (v === 'reload') { cache = {}; epCache = {}; return self.fetch(); }
+        if (v === 'reload') { cache = {}; epCache = {}; HEALTH = {}; lastStreams = null; FORCE = true; return self.fetch(); }
         redraw();
       });
     };
 
     this.start = function () {
+      if (needRefresh && items.length) { needRefresh = false; keepKey = lastFocusKey; self.draw(); } // обновить полосы просмотра после плеера
       Lampa.Controller.add('content', {
         toggle: function () {
+          if (needRefresh && items.length) { needRefresh = false; keepKey = lastFocusKey; self.draw(); }
           Lampa.Controller.collectionSet(html);
           Lampa.Controller.collectionFocus(last || false, html);
           if (last) reveal(last);
@@ -755,23 +938,86 @@
 
     this.pause = function () {}; this.stop = function () {};
     this.render = function () { return html; };
-    this.destroy = function () { html.remove(); items = []; };
+    this.destroy = function () { stopTimer(); html.remove(); items = []; };
   }
 
-  // ---------- загрузка конфига по URL ----------
+  // ---------- настройки: загрузка, экспорт, обновление ----------
+  function applyConfig(j) {
+    if (typeof j === 'string') j = JSON.parse(j);
+    if (j.apis) Lampa.Storage.set(NAME + '_apis', [].concat(j.apis).join(' '));
+    if (j.lampac) Lampa.Storage.set(NAME + '_lampac', [].concat(j.lampac).join(' '));
+    if (typeof j.archive === 'boolean') Lampa.Storage.set(NAME + '_archive', j.archive);
+    if (typeof j.paid === 'boolean') Lampa.Storage.set(NAME + '_paid', j.paid);
+    if (j.sort) Lampa.Storage.set(NAME + '_sort', j.sort);
+    if (j.scale) { Lampa.Storage.set(NAME + '_scale', j.scale); applyCss(); }
+    cache = {}; HEALTH = {};
+  }
   function importConfig() {
     var u = fld('cfgurl', '');
     if (!/^https?:\/\//i.test(u)) return Lampa.Noty.show('Укажите адрес конфигурации');
     request(u, function (j) {
-      try {
-        if (typeof j === 'string') j = JSON.parse(j);
-        if (j.apis) Lampa.Storage.set(NAME + '_apis', [].concat(j.apis).join(' '));
-        if (j.lampac) Lampa.Storage.set(NAME + '_lampac', [].concat(j.lampac).join(' '));
-        if (typeof j.archive === 'boolean') Lampa.Storage.set(NAME + '_archive', j.archive);
-        cache = {};
-        Lampa.Noty.show('MyCombo: настройки загружены');
-      } catch (e) { Lampa.Noty.show('MyCombo: неверный JSON'); }
+      try { applyConfig(j); Lampa.Noty.show('MyCombo: настройки загружены'); } catch (e) { Lampa.Noty.show('MyCombo: неверный JSON'); }
     }, function () { Lampa.Noty.show('MyCombo: не удалось загрузить настройки'); });
+  }
+  function exportConfig() {
+    var text = JSON.stringify({
+      apis: fld('apis', ''), lampac: fld('lampac', DEFAULT_LAMPAC), archive: !!fld('archive', true),
+      paid: !!fld('paid', true), sort: fld('sort', 'source'), scale: fld('scale', '1')
+    });
+    try {
+      Lampa.Utils.copyTextToClipboard(text, function () { Lampa.Noty.show('MyCombo: настройки скопированы'); }, function () { Lampa.Noty.show('MyCombo: не удалось скопировать'); });
+    } catch (e) { Lampa.Noty.show('MyCombo: копирование недоступно'); }
+  }
+  function importClipboard() {
+    try {
+      navigator.clipboard.readText().then(function (t) {
+        try { applyConfig(t); Lampa.Noty.show('MyCombo: настройки вставлены'); } catch (e) { Lampa.Noty.show('MyCombo: в буфере не JSON'); }
+      }, function () { Lampa.Noty.show('MyCombo: нет доступа к буферу, используйте ссылку'); });
+    } catch (e) { Lampa.Noty.show('MyCombo: буфер недоступен, используйте ссылку'); }
+  }
+
+  function xhrText(url, ok, fail) {
+    var x = new XMLHttpRequest();
+    x.open('GET', url, true); x.timeout = 15000;
+    x.onload = function () { (x.status >= 200 && x.status < 300) ? ok(x.responseText) : fail(x.status); };
+    x.onerror = x.ontimeout = function () { fail(0); };
+    x.send();
+  }
+  function cmpVer(a, b) {
+    var x = (a + '').split('.'), y = (b + '').split('.');
+    for (var i = 0; i < Math.max(x.length, y.length); i++) {
+      var d = (parseInt(x[i], 10) || 0) - (parseInt(y[i], 10) || 0);
+      if (d) return d;
+    }
+    return 0;
+  }
+  // сравнивает версию в файле, с которого Lampa загрузила плагин, с версией, которая работает сейчас
+  function checkUpdate(manual) {
+    if (!SELF_URL) { if (manual) Lampa.Noty.show('MyCombo v' + VERSION + ': адрес плагина не определён, проверить нельзя'); return; }
+    xhrText(SELF_URL + (SELF_URL.indexOf('?') > -1 ? '&' : '?') + 'nocache=' + Date.now(), function (t) {
+      var m = (t || '').match(/var VERSION = '([0-9.]+)'/);
+      if (!m) { if (manual) Lampa.Noty.show('MyCombo: не удалось определить версию на сервере'); return; }
+      if (cmpVer(m[1], VERSION) > 0) Lampa.Noty.show('MyCombo: доступна версия ' + m[1] + ' (у вас ' + VERSION + '). Переустановите расширение');
+      else if (manual) Lampa.Noty.show('MyCombo v' + VERSION + ': обновлений нет');
+    }, function (c) { if (manual) Lampa.Noty.show('MyCombo: сервер плагина недоступен (' + c + ')'); });
+  }
+
+  function showLines(title, lines) {
+    Lampa.Select.show({
+      title: title,
+      items: (lines.length ? lines : ['Пусто']).map(function (l) { return { title: l }; }),
+      onSelect: function () { Lampa.Controller.toggle('settings_component'); },
+      onBack: function () { Lampa.Controller.toggle('settings_component'); }
+    });
+  }
+  function showLog() { showLines('Журнал ошибок MyCombo', LOG.slice(-20).reverse()); }
+  function showDiag() {
+    var lines = DIAG.slice();
+    Object.keys(HEALTH).forEach(function (k) {
+      var h = HEALTH[k];
+      lines.push('здоровье ' + k + ': ' + (h.n ? 'отклик ' + h.ms + ' мс' : 'нет ответов') + (h.fail ? ', подряд ошибок ' + h.fail : ''));
+    });
+    showLines('Диагностика источников', lines);
   }
 
   // ---------- регистрация ----------
@@ -784,7 +1030,10 @@
       var movie = e.data.movie;
       var btn = $('<div class="full-start__button selector view--' + NAME + '"><span>MyCombo</span></div>');
       btn.on('hover:enter', function () {
-        Lampa.Activity.push({ url: '', title: movie.title || movie.name, component: NAME, movie: movie, page: 1 });
+        Lampa.Activity.push({
+          url: '', title: movie.title || movie.name, component: NAME, movie: movie, page: 1,
+          persons: e.data.persons, videos: e.data.videos
+        });
       });
       var root = e.object.activity.render();
       var after = root.find('.view--torrent');
@@ -803,6 +1052,14 @@
         onChange: onChange
       });
     };
+    var B = function (name, title, descr, fn) {
+      Lampa.SettingsApi.addParam({
+        component: NAME,
+        param: { name: NAME + '_' + name, type: 'button' },
+        field: { name: title, description: descr || '' },
+        onChange: safe(fn, name)
+      });
+    };
     P('apis', 'input', '', 'Адреса API', 'Один или несколько через пробел. Платные и требующие входа потоки скрываются');
     P('lampac', 'input', DEFAULT_LAMPAC, 'Серверы Lampac', 'Адреса через пробел (свой сервер). Балансеры «только для аккаунта» и платные пропускаются');
     P('paid', 'trigger', true, 'Все балансеры, включая платные', 'Не скрывать источники «только для аккаунта». Если сервер откажет — источник просто пропускается');
@@ -810,12 +1067,15 @@
     P('sort', 'select', 'source', 'Сортировка', '', { source: 'Как у источника', quality: 'По качеству' });
     P('scale', 'select', '1', 'Масштаб', 'Размер текста на ТВ', { '0.85': 'Мельче', '1': 'Обычный', '1.2': 'Крупнее', '1.4': 'Очень крупно' }, applyCss);
     P('cfgurl', 'input', '', 'Адрес конфигурации (JSON)', 'Удобно править на ПК, а на ТВ только вставить ссылку');
-    Lampa.SettingsApi.addParam({
-      component: NAME,
-      param: { name: NAME + '_import', type: 'button' },
-      field: { name: 'Загрузить настройки по ссылке' },
-      onChange: importConfig
-    });
+    B('import', 'Загрузить настройки по ссылке', '', importConfig);
+    B('export', 'Скопировать настройки (JSON)', 'Резервная копия: сохраните текст и вставьте потом', exportConfig);
+    B('importclip', 'Вставить настройки из буфера', 'Работает, если ТВ разрешает чтение буфера', importClipboard);
+    B('update', 'Проверить обновление', 'Установлена версия ' + VERSION, function () { checkUpdate(true); });
+    B('diag', 'Диагностика источников', 'Ответы балансеров и их скорость', showDiag);
+    B('journal', 'Журнал ошибок', 'Если что-то не работает — посмотрите здесь', showLog);
+
+    // раз в 12 часов тихо проверяем, нет ли новой версии
+    if (Date.now() - (parseInt(get('upd_t', 0), 10) || 0) > 12 * 3600 * 1000) { set('upd_t', Date.now()); checkUpdate(false); }
   }
 
   if (window.appready) init();
